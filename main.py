@@ -148,18 +148,17 @@ async def get_token():
 
         # Passo 3: Clicar em SMART
         await page.click("img[src*='btn_smart']")
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
 
-        # Aguarda cookie do CRM (max 30s)
-        for _ in range(30):
-            cookies = await context.cookies()
-            crm = next((c for c in cookies if "crm" in c["name"].lower()), None)
-            if crm:
-                val = urllib.parse.unquote(crm["value"])
-                data = json.loads(val)
-                await browser.close()
-                return data.get("appKey"), data.get("token")
-            await asyncio.sleep(1)
+        # Debug: lista todos os cookies de todos os dominios
+        cookies = await context.cookies()
+        todos = [c["name"] + "@" + c["domain"] for c in cookies]
+        if not any("crm" in c["name"].lower() for c in cookies):
+            await browser.close()
+            raise Exception("Cookies disponiveis: " + str(todos))
 
+        crm = next((c for c in cookies if "crm" in c["name"].lower()), None)
+        val = urllib.parse.unquote(crm["value"])
+        data = json.loads(val)
         await browser.close()
-        return None, None
+        return data.get("appKey"), data.get("token")
