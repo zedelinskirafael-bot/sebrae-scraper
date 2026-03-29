@@ -14,7 +14,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 class ScrapeRequest(BaseModel):
     codigo_cliente: str
-    cliente_id: str  # ID do cliente no seu Supabase
+    cliente_id: str
 
 @app.get("/health")
 async def health():
@@ -24,8 +24,6 @@ async def health():
 async def buscar_cliente(req: ScrapeRequest):
     try:
         dados = await scrape_cliente(req.codigo_cliente)
-        
-        # Salva no Supabase
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         supabase.table("clientes").update({
             "razao_social": dados.get("razao_social"),
@@ -33,7 +31,6 @@ async def buscar_cliente(req: ScrapeRequest):
             "cnpj": dados.get("cnpj"),
             "porte": dados.get("porte"),
         }).eq("id", req.cliente_id).execute()
-
         return {"sucesso": True, "dados": dados}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -43,7 +40,6 @@ async def scrape_cliente(codigo: str):
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
 
-        # Login
         await page.goto(f"{SEBRAE_URL}/login")
         await page.wait_for_load_state("networkidle")
         await page.fill("input[name='username'], input[type='email'], #username", SEBRAE_USER)
@@ -51,18 +47,23 @@ async def scrape_cliente(codigo: str):
         await page.click("button[type='submit']")
         await page.wait_for_load_state("networkidle")
 
-        # Acessa cliente direto pelo código
         await page.goto(f"{SEBRAE_URL}/crm/cadastrarPessoaJuridica/{codigo}")
         await page.wait_for_load_state("networkidle")
-        await asyncio.sleep(3)  # aguarda Angular renderizar
+        await asyncio.sleep(3)
 
-        # Extrai dados
-        dados = await page.evaluate("""() => {
+        js = '''() => {
             const getText = (sel) => {
                 const el = document.querySelector(sel);
                 return el ? el.innerText.trim() : null;
             };
             return {
-                razao_social: getText('[placeholder*="Razão"], [placeholder*="razao"], .razao-social'),
-                nome_fantasia: getText('[placeholder*="Fantasia"], [placeholder*="fantasia"], .nome-fantasia'),
-                cnpj: getText('[placeholder*="CNPJ"], [placeholder*="cnpj"]'
+                razao_social: getText('[placeholder*="Razao"]'),
+                nome_fantasia: getText('[placeholder*="Fantasia"]'),
+                cnpj: getText('[placeholder*="CNPJ"]'),
+                porte: getText('[placeholder*="Porte"]'),
+            };
+        }'''
+
+        dados = await page.evaluate(js)
+        await browser.close()
+        return dados
