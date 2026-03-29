@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 from supabase import create_client
-import os, asyncio, httpx
+import os, asyncio, httpx, urllib.parse, json
 
 app = FastAPI()
 
@@ -21,11 +21,12 @@ class ScrapeRequest(BaseModel):
 async def health():
     return {"status": "ok"}
 
-@app.post("/buscar-cliente")
+@app.post("/buscar-cliente", timeout=120)
 async def buscar_cliente(req: ScrapeRequest):
     try:
-        # 1. Login e captura do token
         app_key, token = await get_token()
+        if not app_key or not token:
+            raise Exception("Falha no login — token não encontrado")
 
         headers = {
             "App_key": app_key,
@@ -33,55 +34,45 @@ async def buscar_cliente(req: ScrapeRequest):
             "Content-Type": "application/json"
         }
 
-        async with httpx.AsyncClient() as client:
-            # 2. Dados da empresa
+        async with httpx.AsyncClient(timeout=30) as client:
             r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}", headers=headers)
-            empresa = r.json()
+            empresa = r.json() if r.status_code == 200 else {}
 
-            # 3. Telefones da empresa
             r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}/telefone", headers=headers)
             telefones_empresa = r.json() if r.status_code == 200 else []
 
-            # 4. Emails da empresa
             r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}/email", headers=headers)
             emails_empresa = r.json() if r.status_code == 200 else []
 
-            # 5. Vínculos (sócios)
             r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}/vinculo", headers=headers)
             socios = r.json() if r.status_code == 200 else []
 
-        # 6. Salva no Supabase
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-        # Atualiza cliente
         supabase.table("clientes").update({
             "nome_fantasia": empresa.get("nomeFantasia") or empresa.get("nome"),
             "cnpj": empresa.get("docId"),
-            "porte": empresa.get("porte", {}).get("descricao") if empresa.get("porte") else None,
         }).eq("id", req.cliente_id).execute()
 
-        # Salva telefones da empresa
-        for tel in telefones_empresa:
+        for tel in (telefones_empresa if isinstance(telefones_empresa, list) else []):
             numero = tel.get("numero") or tel.get("telefone") or str(tel)
             if numero:
-                supabase.table("telefones").upsert({
+                supabase.table("telefones").insert({
                     "cliente_id": req.cliente_id,
                     "numero": numero,
                 }).execute()
 
-        # Salva emails da empresa
-        for em in emails_empresa:
+        for em in (emails_empresa if isinstance(emails_empresa, list) else []):
             endereco = em.get("email") or em.get("endereco") or str(em)
             if endereco:
-                supabase.table("emails").upsert({
+                supabase.table("emails").insert({
                     "cliente_id": req.cliente_id,
                     "email": endereco,
                 }).execute()
 
-        # 7. Para cada sócio, busca dados da PF
         pessoas_salvas = []
-        async with httpx.AsyncClient() as client:
-            for socio in socios:
+        async with httpx.AsyncClient(timeout=30) as client:
+            for socio in (socios if isinstance(socios, list) else []):
                 cod_pf = socio.get("codigo")
                 if not cod_pf:
                     continue
@@ -95,31 +86,28 @@ async def buscar_cliente(req: ScrapeRequest):
                 r = await client.get(f"{SEBRAE_API}/agente/{cod_pf}/email", headers=headers)
                 emails_pf = r.json() if r.status_code == 200 else []
 
-                # Salva pessoa
-                pessoa = supabase.table("pessoas").upsert({
+                pessoa_resp = supabase.table("pessoas").insert({
                     "cliente_id": req.cliente_id,
                     "nome": pf.get("nome") or pf.get("descricao"),
                     "apelido": pf.get("nomeFantasia"),
-                    "vinculo": socio.get("vinculo", {}).get("descricao"),
+                    "vinculo": socio.get("vinculo", {}).get("descricao") if socio.get("vinculo") else None,
                     "codigo_sebrae": str(cod_pf),
                 }).execute()
 
-                pessoa_id = pessoa.data[0]["id"] if pessoa.data else None
+                pessoa_id = pessoa_resp.data[0]["id"] if pessoa_resp.data else None
 
-                # Salva telefones da PF
-                for tel in tels_pf:
+                for tel in (tels_pf if isinstance(tels_pf, list) else []):
                     numero = tel.get("numero") or tel.get("telefone") or str(tel)
                     if numero and pessoa_id:
-                        supabase.table("telefones").upsert({
+                        supabase.table("telefones").insert({
                             "pessoa_id": pessoa_id,
                             "numero": numero,
                         }).execute()
 
-                # Salva emails da PF
-                for em in emails_pf:
+                for em in (emails_pf if isinstance(emails_pf, list) else []):
                     endereco = em.get("email") or em.get("endereco") or str(em)
                     if endereco and pessoa_id:
-                        supabase.table("emails").upsert({
+                        supabase.table("emails").insert({
                             "pessoa_id": pessoa_id,
                             "email": endereco,
                         }).execute()
@@ -129,7 +117,11 @@ async def buscar_cliente(req: ScrapeRequest):
         return {
             "sucesso": True,
             "empresa": empresa.get("nomeFantasia") or empresa.get("nome"),
-            "socios": pessoas_salvas
+            "socios": pessoas_salvas,
+            "debug": {
+                "empresa_raw": empresa,
+                "socios_raw": socios[:2] if socios else []
+            }
         }
 
     except Exception as e:
@@ -138,29 +130,27 @@ async def buscar_cliente(req: ScrapeRequest):
 
 async def get_token():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.goto(f"{SEBRAE_URL}/login")
-        await page.wait_for_load_state("networkidle")
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = await browser.new_context()
+        page = await context.new_page()
+
+        await page.goto(f"{SEBRAE_URL}/login", wait_until="domcontentloaded")
+        await asyncio.sleep(2)
 
         await page.fill("input[name='username'], input[type='email'], #username", SEBRAE_USER)
         await page.fill("input[name='password'], input[type='password'], #password", SEBRAE_PASS)
         await page.click("button[type='submit']")
-        await page.wait_for_load_state("networkidle")
-        await asyncio.sleep(3)
 
-        cookies = await page.context.cookies()
-        crm_cookie = next((c for c in cookies if "crm" in c["name"].lower()), None)
-
-        app_key = None
-        token = None
-
-        if crm_cookie:
-            import urllib.parse, json
-            val = urllib.parse.unquote(crm_cookie["value"])
-            data = json.loads(val)
-            app_key = data.get("appKey")
-            token = data.get("token")
+        # Aguarda cookie aparecer (max 30s)
+        for _ in range(30):
+            cookies = await context.cookies()
+            crm = next((c for c in cookies if "crm" in c["name"].lower()), None)
+            if crm:
+                val = urllib.parse.unquote(crm["value"])
+                data = json.loads(val)
+                await browser.close()
+                return data.get("appKey"), data.get("token")
+            await asyncio.sleep(1)
 
         await browser.close()
-        return app_key, token
+        return None, None
