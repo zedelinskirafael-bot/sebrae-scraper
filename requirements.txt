@@ -3,3 +3,4 @@ uvicorn
 playwright
 supabase
 python-dotenv
+httpx
