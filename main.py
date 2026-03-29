@@ -134,13 +134,23 @@ async def get_token():
         context = await browser.new_context()
         page = await context.new_page()
 
+        # Passo 1: Login
         await page.goto(f"{SEBRAE_URL}/SebraePR/login.do", wait_until="domcontentloaded")
         await asyncio.sleep(2)
-
         await page.fill("input[name='usuario']", SEBRAE_USER)
         await page.fill("input[name='senha']", SEBRAE_PASS)
-        await page.click("input[type='submit'], button[type='submit']")
+        await page.click("input[type='image'][alt='Ok']")
+        await asyncio.sleep(2)
 
+        # Passo 2: Confirmar unidade
+        await page.click("input[type='image'][alt='Entrar no Sistema']")
+        await asyncio.sleep(2)
+
+        # Passo 3: Clicar em SMART
+        await page.click("img[src*='btn_smart']")
+        await asyncio.sleep(3)
+
+        # Aguarda cookie do CRM (max 30s)
         for _ in range(30):
             cookies = await context.cookies()
             crm = next((c for c in cookies if "crm" in c["name"].lower()), None)
