@@ -39,31 +39,16 @@ async def scrape_cliente(codigo: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
-
-        await page.goto(f"{SEBRAE_URL}/login")
+        await page.goto(SEBRAE_URL + "/login")
         await page.wait_for_load_state("networkidle")
         await page.fill("input[name='username'], input[type='email'], #username", SEBRAE_USER)
         await page.fill("input[name='password'], input[type='password'], #password", SEBRAE_PASS)
         await page.click("button[type='submit']")
         await page.wait_for_load_state("networkidle")
-
-        await page.goto(f"{SEBRAE_URL}/crm/cadastrarPessoaJuridica/{codigo}")
+        await page.goto(SEBRAE_URL + "/crm/cadastrarPessoaJuridica/" + codigo)
         await page.wait_for_load_state("networkidle")
         await asyncio.sleep(3)
-
-        js = '''() => {
-            const getText = (sel) => {
-                const el = document.querySelector(sel);
-                return el ? el.innerText.trim() : null;
-            };
-            return {
-                razao_social: getText('[placeholder*="Razao"]'),
-                nome_fantasia: getText('[placeholder*="Fantasia"]'),
-                cnpj: getText('[placeholder*="CNPJ"]'),
-                porte: getText('[placeholder*="Porte"]'),
-            };
-        }'''
-
+        js = "() => { const g = (s) => { const e = document.querySelector(s); return e ? e.innerText.trim() : null; }; return { razao_social: g('[placeholder*=\"Razao\"]'), nome_fantasia: g('[placeholder*=\"Fantasia\"]'), cnpj: g('[placeholder*=\"CNPJ\"]'), porte: g('[placeholder*=\"Porte\"]') }; }"
         dados = await page.evaluate(js)
         await browser.close()
         return dados
