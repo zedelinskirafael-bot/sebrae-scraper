@@ -21,7 +21,7 @@ class ScrapeRequest(BaseModel):
 async def health():
     return {"status": "ok"}
 
-@app.post("/buscar-cliente", timeout=120)
+@app.post("/buscar-cliente")
 async def buscar_cliente(req: ScrapeRequest):
     try:
         app_key, token = await get_token()
