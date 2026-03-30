@@ -70,7 +70,6 @@ async def buscar_cliente(req: ScrapeRequest):
 
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-        # Busca organizacao_id e usuario_id do cliente
         cliente_resp = supabase.table("clientes").select("organizacao_id, usuario_id").eq("id", req.cliente_id).single().execute()
         cliente_data = cliente_resp.data or {}
         org_id = cliente_data.get("organizacao_id")
@@ -90,6 +89,7 @@ async def buscar_cliente(req: ScrapeRequest):
                     "usuario_id": user_id,
                     "referencia_id": req.cliente_id,
                     "numero": numero,
+                    "tipo": "empresa",
                 }).execute()
 
         # Emails da empresa
@@ -101,6 +101,7 @@ async def buscar_cliente(req: ScrapeRequest):
                     "usuario_id": user_id,
                     "referencia_id": req.cliente_id,
                     "endereco": endereco,
+                    "tipo": "empresa",
                 }).execute()
 
         # Sócios
@@ -138,6 +139,7 @@ async def buscar_cliente(req: ScrapeRequest):
                             "usuario_id": user_id,
                             "referencia_id": pessoa_id,
                             "numero": numero,
+                            "tipo": "socio",
                         }).execute()
 
                 for em in (emails_pf if isinstance(emails_pf, list) else []):
@@ -148,6 +150,7 @@ async def buscar_cliente(req: ScrapeRequest):
                             "usuario_id": user_id,
                             "referencia_id": pessoa_id,
                             "endereco": endereco,
+                            "tipo": "socio",
                         }).execute()
 
                 pessoas_salvas.append(pf.get("nome") or str(cod_pf))
