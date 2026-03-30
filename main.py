@@ -48,7 +48,6 @@ async def debug_login():
 @app.post("/buscar-cliente")
 async def buscar_cliente(req: ScrapeRequest):
     try:
-        # 1. Busca token do Sebrae
         token = await get_token()
         headers = {
             "App_key": APP_KEY,
@@ -56,7 +55,6 @@ async def buscar_cliente(req: ScrapeRequest):
             "Content-Type": "application/json"
         }
 
-        # 2. Busca dados do Sebrae
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}", headers=headers)
             empresa = r.json() if r.status_code == 200 else {}
@@ -70,19 +68,20 @@ async def buscar_cliente(req: ScrapeRequest):
             r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}/vinculo", headers=headers)
             socios = r.json() if r.status_code == 200 else []
 
-        # 3. Conecta Supabase e busca o cliente para pegar organizacao_id e usuario_id
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+        # Busca organizacao_id e usuario_id do cliente
         cliente_resp = supabase.table("clientes").select("organizacao_id, usuario_id").eq("id", req.cliente_id).single().execute()
         cliente_data = cliente_resp.data or {}
         org_id = cliente_data.get("organizacao_id")
         user_id = cliente_data.get("usuario_id")
 
-        # 4. Atualiza nome_fantasia do cliente
+        # Atualiza nome_fantasia
         supabase.table("clientes").update({
             "nome_fantasia": empresa.get("nomeFantasia") or empresa.get("nome"),
         }).eq("id", req.cliente_id).execute()
 
-        # 5. Salva telefones da empresa (referencia_id = cliente_id)
+        # Telefones da empresa
         for tel in (telefones_empresa if isinstance(telefones_empresa, list) else []):
             numero = tel.get("numero") or tel.get("telefone") or str(tel)
             if numero:
@@ -91,10 +90,9 @@ async def buscar_cliente(req: ScrapeRequest):
                     "usuario_id": user_id,
                     "referencia_id": req.cliente_id,
                     "numero": numero,
-                    "tipo": tel.get("tipo") or "outros",
                 }).execute()
 
-        # 6. Salva emails da empresa (referencia_id = cliente_id)
+        # Emails da empresa
         for em in (emails_empresa if isinstance(emails_empresa, list) else []):
             endereco = em.get("email") or em.get("endereco") or str(em)
             if endereco:
@@ -103,10 +101,9 @@ async def buscar_cliente(req: ScrapeRequest):
                     "usuario_id": user_id,
                     "referencia_id": req.cliente_id,
                     "endereco": endereco,
-                    "tipo": em.get("tipo") or "outros",
                 }).execute()
 
-        # 7. Salva sócios
+        # Sócios
         pessoas_salvas = []
         async with httpx.AsyncClient(timeout=30) as client:
             for socio in (socios if isinstance(socios, list) else []):
@@ -123,7 +120,6 @@ async def buscar_cliente(req: ScrapeRequest):
                 r = await client.get(f"{SEBRAE_API}/agente/{cod_pf}/email", headers=headers)
                 emails_pf = r.json() if r.status_code == 200 else []
 
-                # Insere pessoa
                 pessoa_resp = supabase.table("pessoas").insert({
                     "organizacao_id": org_id,
                     "usuario_id": user_id,
@@ -134,7 +130,6 @@ async def buscar_cliente(req: ScrapeRequest):
 
                 pessoa_id = pessoa_resp.data[0]["id"] if pessoa_resp.data else None
 
-                # Telefones do sócio (referencia_id = pessoa_id)
                 for tel in (tels_pf if isinstance(tels_pf, list) else []):
                     numero = tel.get("numero") or tel.get("telefone") or str(tel)
                     if numero and pessoa_id:
@@ -143,10 +138,8 @@ async def buscar_cliente(req: ScrapeRequest):
                             "usuario_id": user_id,
                             "referencia_id": pessoa_id,
                             "numero": numero,
-                            "tipo": tel.get("tipo") or "outros",
                         }).execute()
 
-                # Emails do sócio (referencia_id = pessoa_id)
                 for em in (emails_pf if isinstance(emails_pf, list) else []):
                     endereco = em.get("email") or em.get("endereco") or str(em)
                     if endereco and pessoa_id:
@@ -155,7 +148,6 @@ async def buscar_cliente(req: ScrapeRequest):
                             "usuario_id": user_id,
                             "referencia_id": pessoa_id,
                             "endereco": endereco,
-                            "tipo": em.get("tipo") or "outros",
                         }).execute()
 
                 pessoas_salvas.append(pf.get("nome") or str(cod_pf))
