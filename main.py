@@ -1,10 +1,20 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 from supabase import create_client
 import os, asyncio, httpx, re
 
 app = FastAPI()
+
+# Libera CORS para o Lovable e qualquer origem (necessário para chamadas do browser)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 SEBRAE_URL = "https://app2.pr.sebrae.com.br"
 SEBRAE_API = "https://api.pr.sebrae.com.br/crm-api"
@@ -56,26 +66,22 @@ async def buscar_cliente(req: ScrapeRequest):
 
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-        # Busca organizacao_id e usuario_id do cliente
         cliente_resp = supabase.table("clientes").select("organizacao_id, usuario_id").eq("id", req.cliente_id).single().execute()
         cliente_data = cliente_resp.data or {}
         org_id = cliente_data.get("organizacao_id")
         user_id = cliente_data.get("usuario_id")
 
-        # Extrai endereço
         endereco = empresa.get("endereco") or {}
         logradouro = endereco.get("logradouro") or {}
         bairro_obj = endereco.get("bairro") or {}
         geo = endereco.get("geoLocalizacao") or {}
         cep_raw = str(endereco.get("cep") or "")
 
-        # Data de abertura
         data_abertura = None
         data_str = empresa.get("dataAberturaNascimento")
         if data_str:
-            data_abertura = data_str[:10]  # pega só "YYYY-MM-DD"
+            data_abertura = data_str[:10]
 
-        # Atualiza cliente com todos os campos disponíveis
         supabase.table("clientes").update({
             "nome_fantasia": empresa.get("nomeFantasia") or empresa.get("nome"),
             "data_abertura": data_abertura,
@@ -88,9 +94,7 @@ async def buscar_cliente(req: ScrapeRequest):
             "longitude": geo.get("longitude"),
         }).eq("id", req.cliente_id).execute()
 
-        # Telefones — já vêm dentro do empresa_raw
-        telefones_empresa = empresa.get("telefones") or []
-        for tel in telefones_empresa:
+        for tel in (empresa.get("telefones") or []):
             numero = tel.get("telefone") or tel.get("numero")
             if numero:
                 supabase.table("telefones").insert({
@@ -101,9 +105,7 @@ async def buscar_cliente(req: ScrapeRequest):
                     "tipo": "empresa",
                 }).execute()
 
-        # Emails — já vêm dentro do empresa_raw
-        emails_empresa = empresa.get("emails") or []
-        for em in emails_empresa:
+        for em in (empresa.get("emails") or []):
             endereco_email = em.get("email")
             if endereco_email:
                 supabase.table("emails").insert({
@@ -114,7 +116,6 @@ async def buscar_cliente(req: ScrapeRequest):
                     "tipo": "empresa",
                 }).execute()
 
-        # Sócios
         pessoas_salvas = []
         async with httpx.AsyncClient(timeout=30) as client:
             for socio in (socios if isinstance(socios, list) else []):
@@ -135,7 +136,6 @@ async def buscar_cliente(req: ScrapeRequest):
 
                 pessoa_id = pessoa_resp.data[0]["id"] if pessoa_resp.data else None
 
-                # Telefones do sócio — já vêm dentro do pf
                 for tel in (pf.get("telefones") or []):
                     numero = tel.get("telefone") or tel.get("numero")
                     if numero and pessoa_id:
@@ -147,7 +147,6 @@ async def buscar_cliente(req: ScrapeRequest):
                             "tipo": "socio",
                         }).execute()
 
-                # Emails do sócio — já vêm dentro do pf
                 for em in (pf.get("emails") or []):
                     endereco_email = em.get("email")
                     if endereco_email and pessoa_id:
