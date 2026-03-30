@@ -31,21 +31,16 @@ async def debug_login():
     try:
         token = await get_token()
         log.append(f"Token capturado: {token}")
-        log.append(f"APP_KEY configurado: {APP_KEY}")
-
         headers = {
             "App_key": APP_KEY,
             "Authorization": token,
             "Content-Type": "application/json"
         }
-
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.get(f"{SEBRAE_API}/agente/268934", headers=headers)
-            log.append(f"API /agente/268934 — status: {r.status_code}")
-            log.append(f"Resposta: {r.text[:500]}")
-
+            log.append(f"API status: {r.status_code}")
+            log.append(f"Resposta: {r.text[:300]}")
         return {"sucesso": True, "log": log}
-
     except Exception as e:
         return {"sucesso": False, "log": log, "erro": str(e)}
 
@@ -53,14 +48,15 @@ async def debug_login():
 @app.post("/buscar-cliente")
 async def buscar_cliente(req: ScrapeRequest):
     try:
+        # 1. Busca token do Sebrae
         token = await get_token()
-
         headers = {
             "App_key": APP_KEY,
             "Authorization": token,
             "Content-Type": "application/json"
         }
 
+        # 2. Busca dados do Sebrae
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}", headers=headers)
             empresa = r.json() if r.status_code == 200 else {}
@@ -74,32 +70,43 @@ async def buscar_cliente(req: ScrapeRequest):
             r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}/vinculo", headers=headers)
             socios = r.json() if r.status_code == 200 else []
 
+        # 3. Conecta Supabase e busca o cliente para pegar organizacao_id e usuario_id
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        cliente_resp = supabase.table("clientes").select("organizacao_id, usuario_id").eq("id", req.cliente_id).single().execute()
+        cliente_data = cliente_resp.data or {}
+        org_id = cliente_data.get("organizacao_id")
+        user_id = cliente_data.get("usuario_id")
 
-        # Atualiza cliente — apenas campos existentes na tabela
+        # 4. Atualiza nome_fantasia do cliente
         supabase.table("clientes").update({
             "nome_fantasia": empresa.get("nomeFantasia") or empresa.get("nome"),
         }).eq("id", req.cliente_id).execute()
 
-        # Salva telefones da empresa
+        # 5. Salva telefones da empresa (referencia_id = cliente_id)
         for tel in (telefones_empresa if isinstance(telefones_empresa, list) else []):
             numero = tel.get("numero") or tel.get("telefone") or str(tel)
             if numero:
                 supabase.table("telefones").insert({
-                    "cliente_id": req.cliente_id,
+                    "organizacao_id": org_id,
+                    "usuario_id": user_id,
+                    "referencia_id": req.cliente_id,
                     "numero": numero,
+                    "tipo": tel.get("tipo") or "outros",
                 }).execute()
 
-        # Salva emails da empresa
+        # 6. Salva emails da empresa (referencia_id = cliente_id)
         for em in (emails_empresa if isinstance(emails_empresa, list) else []):
             endereco = em.get("email") or em.get("endereco") or str(em)
             if endereco:
                 supabase.table("emails").insert({
-                    "cliente_id": req.cliente_id,
-                    "email": endereco,
+                    "organizacao_id": org_id,
+                    "usuario_id": user_id,
+                    "referencia_id": req.cliente_id,
+                    "endereco": endereco,
+                    "tipo": em.get("tipo") or "outros",
                 }).execute()
 
-        # Salva sócios (pessoas físicas)
+        # 7. Salva sócios
         pessoas_salvas = []
         async with httpx.AsyncClient(timeout=30) as client:
             for socio in (socios if isinstance(socios, list) else []):
@@ -116,30 +123,39 @@ async def buscar_cliente(req: ScrapeRequest):
                 r = await client.get(f"{SEBRAE_API}/agente/{cod_pf}/email", headers=headers)
                 emails_pf = r.json() if r.status_code == 200 else []
 
+                # Insere pessoa
                 pessoa_resp = supabase.table("pessoas").insert({
+                    "organizacao_id": org_id,
+                    "usuario_id": user_id,
                     "cliente_id": req.cliente_id,
                     "nome": pf.get("nome") or pf.get("descricao"),
-                    "apelido": pf.get("nomeFantasia"),
-                    "vinculo": socio.get("vinculo", {}).get("descricao") if socio.get("vinculo") else None,
-                    "codigo_sebrae": str(cod_pf),
+                    "codigo_socio": str(cod_pf),
                 }).execute()
 
                 pessoa_id = pessoa_resp.data[0]["id"] if pessoa_resp.data else None
 
+                # Telefones do sócio (referencia_id = pessoa_id)
                 for tel in (tels_pf if isinstance(tels_pf, list) else []):
                     numero = tel.get("numero") or tel.get("telefone") or str(tel)
                     if numero and pessoa_id:
                         supabase.table("telefones").insert({
-                            "pessoa_id": pessoa_id,
+                            "organizacao_id": org_id,
+                            "usuario_id": user_id,
+                            "referencia_id": pessoa_id,
                             "numero": numero,
+                            "tipo": tel.get("tipo") or "outros",
                         }).execute()
 
+                # Emails do sócio (referencia_id = pessoa_id)
                 for em in (emails_pf if isinstance(emails_pf, list) else []):
                     endereco = em.get("email") or em.get("endereco") or str(em)
                     if endereco and pessoa_id:
                         supabase.table("emails").insert({
-                            "pessoa_id": pessoa_id,
-                            "email": endereco,
+                            "organizacao_id": org_id,
+                            "usuario_id": user_id,
+                            "referencia_id": pessoa_id,
+                            "endereco": endereco,
+                            "tipo": em.get("tipo") or "outros",
                         }).execute()
 
                 pessoas_salvas.append(pf.get("nome") or str(cod_pf))
@@ -159,7 +175,6 @@ async def buscar_cliente(req: ScrapeRequest):
 
 
 async def get_token() -> str:
-    """Faz login no SMART e retorna o token dinâmico da URL do CRM."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -176,7 +191,6 @@ async def get_token() -> str:
         context.on("page", handle_popup)
 
         try:
-            # Etapa 1: Login
             await page.goto(f"{SEBRAE_URL}/SebraePR/login.do", wait_until="domcontentloaded")
             await asyncio.sleep(2)
             await page.fill("input[name='usuario']", SEBRAE_USER)
@@ -184,28 +198,24 @@ async def get_token() -> str:
             await page.click("input[type='image'][alt='Ok']")
             await asyncio.sleep(3)
 
-            # Etapa 2: Confirmar unidade
             try:
                 await page.click("input[type='image'][alt='Entrar no Sistema']", timeout=5000)
             except Exception:
                 pass
             await asyncio.sleep(3)
 
-            # Etapa 3: Clicar SMART
             try:
                 await page.click("img[src*='btn_smart']", timeout=5000)
             except Exception:
                 pass
             await asyncio.sleep(5)
 
-            # Aguarda popup
             if popup_page:
                 try:
                     await popup_page.wait_for_load_state("networkidle", timeout=20000)
                 except Exception:
                     await asyncio.sleep(5)
 
-                # Etapa 4: Pessoas → Cadastro/Consulta
                 try:
                     await popup_page.hover("text=Pessoas", timeout=5000)
                     await asyncio.sleep(1)
@@ -224,12 +234,9 @@ async def get_token() -> str:
 
                 url_atual = popup_page.url
                 token = _extrair_token_da_url(url_atual)
-
                 await browser.close()
-
                 if token:
                     return token
-
                 raise Exception(f"Token não encontrado na URL: {url_atual}")
 
             await browser.close()
