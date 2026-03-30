@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 from supabase import create_client
-import os, asyncio, httpx, urllib.parse, json
+import os, asyncio, httpx, re
 
 app = FastAPI()
 
@@ -33,12 +33,13 @@ async def debug_login():
 @app.post("/buscar-cliente")
 async def buscar_cliente(req: ScrapeRequest):
     try:
-        app_key, token = await get_token()
-        if not app_key or not token:
+        token, cod_unidade = await get_token()
+        if not token:
             raise Exception("Falha no login — token não encontrado")
 
+        # A API usa o token como App_key no header
         headers = {
-            "App_key": app_key,
+            "App_key": token,
             "Authorization": token,
             "Content-Type": "application/json"
         }
@@ -127,6 +128,10 @@ async def buscar_cliente(req: ScrapeRequest):
             "sucesso": True,
             "empresa": empresa.get("nomeFantasia") or empresa.get("nome"),
             "socios": pessoas_salvas,
+            "debug": {
+                "empresa_raw": empresa,
+                "socios_raw": socios[:2] if socios else []
+            }
         }
 
     except Exception as e:
@@ -134,6 +139,7 @@ async def buscar_cliente(req: ScrapeRequest):
 
 
 async def _debug_completo_login():
+    """Debug completo — executa login, navega até CRM e extrai token da URL."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -141,43 +147,10 @@ async def _debug_completo_login():
         )
         context = await browser.new_context()
         page = await context.new_page()
-
         log = []
-        requisicoes_api = []
-        respostas_api = []
-
-        async def on_request(request):
-            url = request.url
-            if "sebrae.com.br" in url:
-                headers = dict(request.headers)
-                requisicoes_api.append({
-                    "url": url,
-                    "method": request.method,
-                    "App_key": headers.get("app_key") or headers.get("App_key") or headers.get("APP_KEY"),
-                    "Authorization": headers.get("authorization") or headers.get("Authorization"),
-                    "outros_headers": {k: v for k, v in headers.items()
-                                       if k.lower() not in ["cookie", "user-agent", "accept", "accept-encoding",
-                                                             "accept-language", "connection", "referer"]},
-                })
-
-        async def on_response(response):
-            url = response.url
-            if "api.pr.sebrae.com.br" in url:
-                try:
-                    body = await response.text()
-                    respostas_api.append({
-                        "url": url,
-                        "status": response.status,
-                        "body_preview": body[:500],
-                    })
-                except Exception:
-                    pass
-
-        page.on("request", on_request)
-        page.on("response", on_response)
 
         try:
-            # ETAPA 1
+            # ETAPA 1: Login
             log.append("Etapa 1: login...")
             await page.goto(f"{SEBRAE_URL}/SebraePR/login.do", wait_until="domcontentloaded")
             await asyncio.sleep(2)
@@ -187,7 +160,7 @@ async def _debug_completo_login():
             await asyncio.sleep(3)
             log.append(f"Etapa 1 OK — URL: {page.url}")
 
-            # ETAPA 2
+            # ETAPA 2: Confirmar unidade
             log.append("Etapa 2: confirmando unidade...")
             try:
                 await page.click("input[type='image'][alt='Entrar no Sistema']", timeout=5000)
@@ -196,7 +169,7 @@ async def _debug_completo_login():
             await asyncio.sleep(3)
             log.append(f"Etapa 2 OK — URL: {page.url}")
 
-            # ETAPA 3 — captura popup
+            # ETAPA 3: Clicar SMART — abre popup
             log.append("Etapa 3: clicando SMART...")
             popup_page = None
 
@@ -204,89 +177,110 @@ async def _debug_completo_login():
                 nonlocal popup_page
                 popup_page = popup
                 log.append(f"Popup detectado: {popup.url}")
-                popup.on("request", on_request)
-                popup.on("response", on_response)
 
             context.on("page", handle_popup)
 
             try:
                 await page.click("img[src*='btn_smart']", timeout=5000)
             except Exception as e3:
-                log.append(f"Click img falhou: {e3}")
-                try:
-                    await page.click("a[href*='smart'], a[href*='SMART']", timeout=3000)
-                except Exception as e3b:
-                    log.append(f"Click link também falhou: {e3b}")
+                log.append(f"Click SMART falhou: {e3}")
 
             await asyncio.sleep(5)
 
             if popup_page:
-                log.append(f"Aguardando popup carregar...")
                 try:
                     await popup_page.wait_for_load_state("networkidle", timeout=20000)
                 except Exception:
-                    await asyncio.sleep(8)
-                log.append(f"Popup URL final: {popup_page.url}")
+                    await asyncio.sleep(5)
+                log.append(f"Popup carregado: {popup_page.url}")
 
-                # Procura token no JavaScript da página
+                # ETAPA 4: Navegar para Pessoas → Cadastro/Consulta
+                log.append("Etapa 4: clicando em Pessoas → Cadastro/Consulta...")
                 try:
-                    scripts = await popup_page.evaluate("""() => {
-                        const results = [];
-                        const keys = ['appKey', 'App_key', 'token', 'authToken', 'authorization', 'crmToken', 'APP_KEY'];
-                        for (const key of keys) {
-                            if (window[key]) results.push({fonte: 'window', key, value: String(window[key]).substring(0, 200)});
-                        }
-                        try {
-                            for (let i = 0; i < localStorage.length; i++) {
-                                const k = localStorage.key(i);
-                                results.push({fonte: 'localStorage', key: k, value: localStorage.getItem(k).substring(0, 200)});
+                    # Hover no menu Pessoas para abrir submenu
+                    await popup_page.hover("text=Pessoas", timeout=5000)
+                    await asyncio.sleep(1)
+                    # Clicar em Cadastro/Consulta
+                    await popup_page.click("text=Cadastro/Consulta", timeout=5000)
+                    await asyncio.sleep(3)
+                    log.append(f"URL após Cadastro/Consulta: {popup_page.url}")
+                except Exception as e4:
+                    log.append(f"Erro ao clicar Pessoas/Cadastro: {e4}")
+                    # Tenta navegar direto para a URL do CRM
+                    try:
+                        await popup_page.goto(
+                            f"{SEBRAE_URL}/crm/consultarcliente",
+                            wait_until="domcontentloaded",
+                            timeout=15000
+                        )
+                        await asyncio.sleep(3)
+                        log.append(f"URL após goto direto: {popup_page.url}")
+                    except Exception as e4b:
+                        log.append(f"Goto direto também falhou: {e4b}")
+
+                # Extrai token da URL
+                url_atual = popup_page.url
+                log.append(f"URL final para extração: {url_atual}")
+
+                token = _extrair_token_da_url(url_atual)
+                cod_unidade = _extrair_parametro(url_atual, "codUnidade")
+
+                if token:
+                    log.append(f"TOKEN ENCONTRADO: {token}")
+                    log.append(f"codUnidade: {cod_unidade}")
+
+                    # Testa a API com o token
+                    log.append("Testando API com o token...")
+                    try:
+                        async with httpx.AsyncClient(timeout=15) as client:
+                            headers = {
+                                "App_key": token,
+                                "Authorization": token,
+                                "Content-Type": "application/json"
                             }
-                        } catch(e) {}
-                        try {
-                            for (let i = 0; i < sessionStorage.length; i++) {
-                                const k = sessionStorage.key(i);
-                                results.push({fonte: 'sessionStorage', key: k, value: sessionStorage.getItem(k).substring(0, 200)});
-                            }
-                        } catch(e) {}
-                        return results;
-                    }""")
-                    log.append(f"JS globals/storage: {scripts}")
-                except Exception as ejs:
-                    log.append(f"Erro JS: {ejs}")
-
-                # Captura HTML do popup (primeiros 2000 chars)
-                try:
-                    html = await popup_page.content()
-                    log.append(f"HTML popup (inicio): {html[:2000]}")
-                except Exception:
-                    pass
-
-            await asyncio.sleep(3)
-
-            cookies_final = await context.cookies()
-            cookies_info = [{"name": c["name"], "domain": c["domain"],
-                             "value_preview": c["value"][:100]} for c in cookies_final]
+                            r = await client.get(f"{SEBRAE_API}/agente/268934", headers=headers)
+                            log.append(f"API /agente/268934 — status: {r.status_code}")
+                            log.append(f"API response: {r.text[:300]}")
+                    except Exception as eapi:
+                        log.append(f"Erro ao testar API: {eapi}")
+                else:
+                    log.append("Token NÃO encontrado na URL — verificar HTML da página")
+                    # Tenta achar o token no HTML
+                    try:
+                        html = await popup_page.content()
+                        tokens_html = re.findall(
+                            r'token[="\s:]+([a-f0-9\-]{36})',
+                            html, re.IGNORECASE
+                        )
+                        log.append(f"Tokens no HTML: {tokens_html[:5]}")
+                    except Exception:
+                        pass
 
             await browser.close()
-
-            return {
-                "sucesso": True,
-                "log": log,
-                "cookies": cookies_info,
-                "requisicoes_sebrae": requisicoes_api[:30],
-                "respostas_api": respostas_api[:10],
-            }
+            return {"sucesso": True, "log": log}
 
         except Exception as e:
             try:
                 await browser.close()
             except Exception:
                 pass
-            return {"sucesso": False, "log": log, "erro": str(e),
-                    "requisicoes_capturadas": requisicoes_api}
+            return {"sucesso": False, "log": log, "erro": str(e)}
+
+
+def _extrair_token_da_url(url: str) -> str | None:
+    """Extrai o parâmetro 'token' de uma URL."""
+    match = re.search(r'[?&]token=([a-f0-9\-]{36})', url, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def _extrair_parametro(url: str, param: str) -> str | None:
+    """Extrai um parâmetro qualquer de uma URL."""
+    match = re.search(rf'[?&]{param}=([^&]+)', url, re.IGNORECASE)
+    return match.group(1) if match else None
 
 
 async def get_token():
+    """Executa o login completo e retorna (token, cod_unidade)."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -294,32 +288,16 @@ async def get_token():
         )
         context = await browser.new_context()
         page = await context.new_page()
-
-        app_key_found = None
-        token_found = None
-
-        async def on_request(request):
-            nonlocal app_key_found, token_found
-            if "api.pr.sebrae.com.br" in request.url:
-                headers = dict(request.headers)
-                ak = headers.get("app_key") or headers.get("App_key") or headers.get("APP_KEY")
-                tk = headers.get("authorization") or headers.get("Authorization")
-                if ak:
-                    app_key_found = ak
-                if tk:
-                    token_found = tk
-
         popup_page = None
 
         async def handle_popup(popup):
             nonlocal popup_page
             popup_page = popup
-            popup.on("request", on_request)
 
-        page.on("request", on_request)
         context.on("page", handle_popup)
 
         try:
+            # Etapas 1, 2 e 3
             await page.goto(f"{SEBRAE_URL}/SebraePR/login.do", wait_until="domcontentloaded")
             await asyncio.sleep(2)
             await page.fill("input[name='usuario']", SEBRAE_USER)
@@ -336,10 +314,7 @@ async def get_token():
             try:
                 await page.click("img[src*='btn_smart']", timeout=5000)
             except Exception:
-                try:
-                    await page.click("a[href*='smart'], a[href*='SMART']", timeout=3000)
-                except Exception:
-                    pass
+                pass
 
             await asyncio.sleep(5)
 
@@ -347,16 +322,38 @@ async def get_token():
                 try:
                     await popup_page.wait_for_load_state("networkidle", timeout=20000)
                 except Exception:
-                    await asyncio.sleep(8)
+                    await asyncio.sleep(5)
 
-            await asyncio.sleep(5)
+                # Navega para Pessoas → Cadastro/Consulta
+                try:
+                    await popup_page.hover("text=Pessoas", timeout=5000)
+                    await asyncio.sleep(1)
+                    await popup_page.click("text=Cadastro/Consulta", timeout=5000)
+                    await asyncio.sleep(3)
+                except Exception:
+                    try:
+                        await popup_page.goto(
+                            f"{SEBRAE_URL}/crm/consultarcliente",
+                            wait_until="domcontentloaded",
+                            timeout=15000
+                        )
+                        await asyncio.sleep(3)
+                    except Exception:
+                        pass
+
+                url_atual = popup_page.url
+                token = _extrair_token_da_url(url_atual)
+                cod_unidade = _extrair_parametro(url_atual, "codUnidade")
+
+                await browser.close()
+
+                if token:
+                    return token, cod_unidade
+
+                raise Exception(f"Token não encontrado na URL: {url_atual}")
 
             await browser.close()
-
-            if app_key_found and token_found:
-                return app_key_found, token_found
-
-            raise Exception(f"Token não encontrado. app_key={app_key_found}, token={token_found}")
+            raise Exception("Popup não detectado após clicar em SMART")
 
         except Exception as e:
             try:
