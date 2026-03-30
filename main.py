@@ -31,11 +31,7 @@ async def debug_login():
     try:
         token = await get_token()
         log.append(f"Token capturado: {token}")
-        headers = {
-            "App_key": APP_KEY,
-            "Authorization": token,
-            "Content-Type": "application/json"
-        }
+        headers = {"App_key": APP_KEY, "Authorization": token, "Content-Type": "application/json"}
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.get(f"{SEBRAE_API}/agente/268934", headers=headers)
             log.append(f"API status: {r.status_code}")
@@ -49,40 +45,53 @@ async def debug_login():
 async def buscar_cliente(req: ScrapeRequest):
     try:
         token = await get_token()
-        headers = {
-            "App_key": APP_KEY,
-            "Authorization": token,
-            "Content-Type": "application/json"
-        }
+        headers = {"App_key": APP_KEY, "Authorization": token, "Content-Type": "application/json"}
 
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}", headers=headers)
             empresa = r.json() if r.status_code == 200 else {}
-
-            r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}/telefone", headers=headers)
-            telefones_empresa = r.json() if r.status_code == 200 else []
-
-            r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}/email", headers=headers)
-            emails_empresa = r.json() if r.status_code == 200 else []
 
             r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}/vinculo", headers=headers)
             socios = r.json() if r.status_code == 200 else []
 
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+        # Busca organizacao_id e usuario_id do cliente
         cliente_resp = supabase.table("clientes").select("organizacao_id, usuario_id").eq("id", req.cliente_id).single().execute()
         cliente_data = cliente_resp.data or {}
         org_id = cliente_data.get("organizacao_id")
         user_id = cliente_data.get("usuario_id")
 
-        # Atualiza nome_fantasia
+        # Extrai endereço
+        endereco = empresa.get("endereco") or {}
+        logradouro = endereco.get("logradouro") or {}
+        bairro_obj = endereco.get("bairro") or {}
+        geo = endereco.get("geoLocalizacao") or {}
+        cep_raw = str(endereco.get("cep") or "")
+
+        # Data de abertura
+        data_abertura = None
+        data_str = empresa.get("dataAberturaNascimento")
+        if data_str:
+            data_abertura = data_str[:10]  # pega só "YYYY-MM-DD"
+
+        # Atualiza cliente com todos os campos disponíveis
         supabase.table("clientes").update({
             "nome_fantasia": empresa.get("nomeFantasia") or empresa.get("nome"),
+            "data_abertura": data_abertura,
+            "rua": logradouro.get("descricao"),
+            "numero": endereco.get("numero"),
+            "complemento": endereco.get("complemento"),
+            "bairro": bairro_obj.get("descricao"),
+            "cep": cep_raw,
+            "latitude": geo.get("latitude"),
+            "longitude": geo.get("longitude"),
         }).eq("id", req.cliente_id).execute()
 
-        # Telefones da empresa
-        for tel in (telefones_empresa if isinstance(telefones_empresa, list) else []):
-            numero = tel.get("numero") or tel.get("telefone") or str(tel)
+        # Telefones — já vêm dentro do empresa_raw
+        telefones_empresa = empresa.get("telefones") or []
+        for tel in telefones_empresa:
+            numero = tel.get("telefone") or tel.get("numero")
             if numero:
                 supabase.table("telefones").insert({
                     "organizacao_id": org_id,
@@ -92,15 +101,16 @@ async def buscar_cliente(req: ScrapeRequest):
                     "tipo": "empresa",
                 }).execute()
 
-        # Emails da empresa
-        for em in (emails_empresa if isinstance(emails_empresa, list) else []):
-            endereco = em.get("email") or em.get("endereco") or str(em)
-            if endereco:
+        # Emails — já vêm dentro do empresa_raw
+        emails_empresa = empresa.get("emails") or []
+        for em in emails_empresa:
+            endereco_email = em.get("email")
+            if endereco_email:
                 supabase.table("emails").insert({
                     "organizacao_id": org_id,
                     "usuario_id": user_id,
                     "referencia_id": req.cliente_id,
-                    "endereco": endereco,
+                    "endereco": endereco_email,
                     "tipo": "empresa",
                 }).execute()
 
@@ -115,12 +125,6 @@ async def buscar_cliente(req: ScrapeRequest):
                 r = await client.get(f"{SEBRAE_API}/agente/{cod_pf}", headers=headers)
                 pf = r.json() if r.status_code == 200 else {}
 
-                r = await client.get(f"{SEBRAE_API}/agente/{cod_pf}/telefone", headers=headers)
-                tels_pf = r.json() if r.status_code == 200 else []
-
-                r = await client.get(f"{SEBRAE_API}/agente/{cod_pf}/email", headers=headers)
-                emails_pf = r.json() if r.status_code == 200 else []
-
                 pessoa_resp = supabase.table("pessoas").insert({
                     "organizacao_id": org_id,
                     "usuario_id": user_id,
@@ -131,8 +135,9 @@ async def buscar_cliente(req: ScrapeRequest):
 
                 pessoa_id = pessoa_resp.data[0]["id"] if pessoa_resp.data else None
 
-                for tel in (tels_pf if isinstance(tels_pf, list) else []):
-                    numero = tel.get("numero") or tel.get("telefone") or str(tel)
+                # Telefones do sócio — já vêm dentro do pf
+                for tel in (pf.get("telefones") or []):
+                    numero = tel.get("telefone") or tel.get("numero")
                     if numero and pessoa_id:
                         supabase.table("telefones").insert({
                             "organizacao_id": org_id,
@@ -142,14 +147,15 @@ async def buscar_cliente(req: ScrapeRequest):
                             "tipo": "socio",
                         }).execute()
 
-                for em in (emails_pf if isinstance(emails_pf, list) else []):
-                    endereco = em.get("email") or em.get("endereco") or str(em)
-                    if endereco and pessoa_id:
+                # Emails do sócio — já vêm dentro do pf
+                for em in (pf.get("emails") or []):
+                    endereco_email = em.get("email")
+                    if endereco_email and pessoa_id:
                         supabase.table("emails").insert({
                             "organizacao_id": org_id,
                             "usuario_id": user_id,
                             "referencia_id": pessoa_id,
-                            "endereco": endereco,
+                            "endereco": endereco_email,
                             "tipo": "socio",
                         }).execute()
 
@@ -159,10 +165,6 @@ async def buscar_cliente(req: ScrapeRequest):
             "sucesso": True,
             "empresa": empresa.get("nomeFantasia") or empresa.get("nome"),
             "socios": pessoas_salvas,
-            "debug": {
-                "empresa_raw": empresa,
-                "socios_raw": socios[:2] if socios else []
-            }
         }
 
     except Exception as e:
