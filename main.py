@@ -12,7 +12,7 @@ SEBRAE_USER = os.getenv("SEBRAE_USER")
 SEBRAE_PASS = os.getenv("SEBRAE_PASS")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-APP_KEY = os.getenv("APP_KEY")  # chave fixa da aplicação CRM
+APP_KEY = os.getenv("APP_KEY")
 
 
 class ScrapeRequest(BaseModel):
@@ -76,11 +76,12 @@ async def buscar_cliente(req: ScrapeRequest):
 
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+        # Atualiza cliente — apenas campos existentes na tabela
         supabase.table("clientes").update({
             "nome_fantasia": empresa.get("nomeFantasia") or empresa.get("nome"),
-            "cnpj": empresa.get("docId"),
         }).eq("id", req.cliente_id).execute()
 
+        # Salva telefones da empresa
         for tel in (telefones_empresa if isinstance(telefones_empresa, list) else []):
             numero = tel.get("numero") or tel.get("telefone") or str(tel)
             if numero:
@@ -89,6 +90,7 @@ async def buscar_cliente(req: ScrapeRequest):
                     "numero": numero,
                 }).execute()
 
+        # Salva emails da empresa
         for em in (emails_empresa if isinstance(emails_empresa, list) else []):
             endereco = em.get("email") or em.get("endereco") or str(em)
             if endereco:
@@ -97,6 +99,7 @@ async def buscar_cliente(req: ScrapeRequest):
                     "email": endereco,
                 }).execute()
 
+        # Salva sócios (pessoas físicas)
         pessoas_salvas = []
         async with httpx.AsyncClient(timeout=30) as client:
             for socio in (socios if isinstance(socios, list) else []):
