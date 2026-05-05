@@ -7,7 +7,6 @@ import os, asyncio, httpx, re
 
 app = FastAPI()
 
-# Libera CORS para o Lovable e qualquer origem (necessário para chamadas do browser)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,6 +17,7 @@ app.add_middleware(
 
 SEBRAE_URL = "https://app2.pr.sebrae.com.br"
 SEBRAE_API = "https://api.pr.sebrae.com.br/crm-api"
+BANCO_PERGUNTAS_API = "https://api.pr.sebrae.com.br/banco-perguntas-api"
 SEBRAE_USER = os.getenv("SEBRAE_USER")
 SEBRAE_PASS = os.getenv("SEBRAE_PASS")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -170,6 +170,104 @@ async def buscar_cliente(req: ScrapeRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/buscar-pesquisas")
+async def buscar_pesquisas(req: ScrapeRequest):
+    try:
+        token = await get_token()
+        headers = {"App_key": APP_KEY, "Authorization": token, "Content-Type": "application/json"}
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.get(
+                f"{BANCO_PERGUNTAS_API}/usuario/pj/{req.codigo_cliente}/pesquisas-respondidas-finalizadas",
+                headers=headers
+            )
+            pesquisas = r.json() if r.status_code == 200 and r.text else []
+            if not isinstance(pesquisas, list):
+                pesquisas = []
+
+            supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+            cliente_resp = supabase.table("clientes").select("organizacao_id").eq("id", req.cliente_id).single().execute()
+            org_id = (cliente_resp.data or {}).get("organizacao_id")
+
+            salvas = 0
+            for pesq in pesquisas:
+                if not pesq.get("finalizada"):
+                    continue
+                uuid_pesq = pesq.get("uuidPesquisa")
+                cod_resposta = pesq.get("codReposta")
+                tipo = pesq.get("nomePesquisaTxt") or "Pesquisa"
+                data_preenchimento = pesq.get("dataPreenchimento")
+
+                conteudo = {
+                    "razao_social": None,
+                    "data_coleta": data_preenchimento,
+                    "questionarios": []
+                }
+
+                for quest in (pesq.get("questionarios") or []):
+                    uuid_q = quest.get("uuidQuestionario")
+                    titulo_q = quest.get("tituloQuestionarioTxt")
+
+                    rel = await client.get(
+                        f"{BANCO_PERGUNTAS_API}/pesquisa/public//{uuid_pesq}/relatorio-preenchimento"
+                        f"?uuidQuestionario={uuid_q}&codResposta={cod_resposta}",
+                        headers=headers
+                    )
+                    if rel.status_code != 200:
+                        continue
+                    rel_data = rel.json()
+                    if not conteudo["razao_social"]:
+                        conteudo["razao_social"] = rel_data.get("razaoSocial")
+
+                    perguntas_extraidas = []
+                    paginas = ((rel_data.get("questionario") or {}).get("paginas")) or []
+                    for pag in paginas:
+                        for p in pag.get("perguntas") or []:
+                            texto_pergunta = (p.get("tituloTexto") or "")[:1000]
+                            opcoes = {}
+                            for d in p.get("dominios") or []:
+                                if d.get("nmeDominioConfig") == "LISTA_OPCOES_INFORMADA_USUARIO":
+                                    op = d.get("opcoes") or {}
+                                    for opt in op.get("dominios") or []:
+                                        cod = opt.get("cod")
+                                        valor = opt.get("valorString")
+                                        if cod and valor:
+                                            opcoes[cod] = valor
+                            resposta = p.get("resposta") or {}
+                            valores = []
+                            for vr in resposta.get("valoresResposta") or []:
+                                cod_d = vr.get("codDominio")
+                                if cod_d and cod_d in opcoes:
+                                    valores.append(opcoes[cod_d])
+                                else:
+                                    val_str = vr.get("valorString") or vr.get("valorTexto")
+                                    if val_str:
+                                        valores.append(str(val_str))
+                            perguntas_extraidas.append({
+                                "texto": texto_pergunta,
+                                "respostas": valores
+                            })
+
+                    conteudo["questionarios"].append({
+                        "titulo": titulo_q,
+                        "perguntas": perguntas_extraidas
+                    })
+
+                supabase.table("pesquisas_smart_cliente").upsert({
+                    "cliente_id": req.cliente_id,
+                    "organizacao_id": org_id,
+                    "tipo": tipo,
+                    "data_preenchimento": data_preenchimento,
+                    "conteudo": conteudo
+                }, on_conflict="cliente_id,tipo,data_preenchimento").execute()
+                salvas += 1
+
+            return {"sucesso": True, "pesquisas_salvas": salvas, "total_encontradas": len(pesquisas)}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 async def get_token() -> str:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -233,10 +331,10 @@ async def get_token() -> str:
                 await browser.close()
                 if token:
                     return token
-                raise Exception(f"Token não encontrado na URL: {url_atual}")
+                raise Exception(f"Token nao encontrado na URL: {url_atual}")
 
             await browser.close()
-            raise Exception("Popup não detectado")
+            raise Exception("Popup nao detectado")
 
         except Exception as e:
             try:
