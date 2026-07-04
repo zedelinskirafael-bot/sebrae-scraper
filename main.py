@@ -457,7 +457,17 @@ async def _buscar_codigo_por_cnpj(page, cnpj: str):
         except Exception:
             continue
 
-    await asyncio.sleep(4)
+    try:
+        await page.wait_for_selector("tbody tr td", state="visible", timeout=15000)
+    except Exception:
+        return None
+
+    try:
+        codigo_txt = (await page.locator("tbody tr td:first-child").first.inner_text()).strip()
+        if codigo_txt.isdigit() and len(codigo_txt) >= 4:
+            return codigo_txt
+    except Exception:
+        pass
 
     html = await page.content()
     padroes = [
