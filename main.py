@@ -398,22 +398,32 @@ async def _fazer_login_e_abrir_smart(p):
         raise
 
 
-async def _buscar_codigo_por_cnpj(page, cnpj: str):
-    current_url = page.url
-    token_match = re.search(r"[?&]token=([a-f0-9\-]{36})", current_url, re.IGNORECASE)
-    cod_unidade_match = re.search(r"[?&]codUnidade=(\d+)", current_url, re.IGNORECASE)
-    qs_parts = ["lv=1.1.0"]
-    if token_match:
-        qs_parts.append(f"token={token_match.group(1)}")
-    if cod_unidade_match:
-        qs_parts.append(f"codUnidade={cod_unidade_match.group(1)}")
-    qs = "?" + "&".join(qs_parts)
+async def _abrir_crm_consulta(page):
+    if "/crm/consultarcliente" in page.url:
+        return
+    try:
+        await page.hover("text=Pessoas", timeout=5000)
+        await asyncio.sleep(1)
+        await page.click("text=Cadastro/Consulta", timeout=5000)
+        await asyncio.sleep(3)
+    except Exception:
+        pass
+    try:
+        await page.wait_for_url("**/crm/consultarcliente**", timeout=15000)
+    except Exception:
+        pass
+    if "/crm/consultarcliente" not in page.url:
+        raise Exception(
+            f"Nao consegui abrir /crm/consultarcliente via menu Pessoas>Cadastro/Consulta. URL atual: {page.url}"
+        )
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
 
-    await page.goto(
-        f"{SEBRAE_URL}/crm/consultarcliente{qs}",
-        wait_until="networkidle",
-        timeout=30000,
-    )
+
+async def _buscar_codigo_por_cnpj(page, cnpj: str):
+    await _abrir_crm_consulta(page)
 
     input_sel = "#input-cnpj input"
     try:
