@@ -30,6 +30,11 @@ class ScrapeRequest(BaseModel):
     cliente_id: str
 
 
+class GraduarRequest(BaseModel):
+    cnpj: str
+    cliente_id: str
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -268,82 +273,225 @@ async def buscar_pesquisas(req: ScrapeRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/graduar-cliente-maquina")
+async def graduar_cliente_maquina(req: GraduarRequest):
+    cnpj = re.sub(r"\D", "", req.cnpj or "")
+    if len(cnpj) != 14:
+        raise HTTPException(status_code=400, detail=f"CNPJ invalido: {req.cnpj}")
+
+    try:
+        async with async_playwright() as p:
+            browser, popup_page = await _fazer_login_e_abrir_smart(p)
+            try:
+                codigo = await _buscar_codigo_por_cnpj(popup_page, cnpj)
+                if not codigo:
+                    return {"sucesso": True, "encontrado": False}
+
+                visitas = await _contar_visitas_pap(popup_page, codigo)
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        supabase.table("clientes").update({
+            "codigo": codigo,
+            "visitas_anteriores": visitas,
+            "origem": "sebrae",
+        }).eq("id", req.cliente_id).execute()
+
+        return {
+            "sucesso": True,
+            "encontrado": True,
+            "codigo": codigo,
+            "visitas": visitas,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 async def get_token() -> str:
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
-        )
-        context = await browser.new_context()
-        page = await context.new_page()
-        popup_page = None
-
-        async def handle_popup(popup):
-            nonlocal popup_page
-            popup_page = popup
-
-        context.on("page", handle_popup)
-
+        browser, popup_page = await _fazer_login_e_abrir_smart(p)
         try:
-            await page.goto(f"{SEBRAE_URL}/SebraePR/login.do", wait_until="domcontentloaded")
-            await asyncio.sleep(2)
-            await page.fill("input[name='usuario']", SEBRAE_USER)
-            await page.fill("input[name='senha']", SEBRAE_PASS)
-            await page.click("input[type='image'][alt='Ok']")
-            await asyncio.sleep(3)
-
             try:
-                await page.click("input[type='image'][alt='Entrar no Sistema']", timeout=5000)
+                await popup_page.hover("text=Pessoas", timeout=5000)
+                await asyncio.sleep(1)
+                await popup_page.click("text=Cadastro/Consulta", timeout=5000)
+                await asyncio.sleep(3)
             except Exception:
-                pass
-            await asyncio.sleep(3)
-
-            try:
-                await page.click("img[src*='btn_smart']", timeout=5000)
-            except Exception:
-                pass
-            await asyncio.sleep(5)
-
-            if popup_page:
                 try:
-                    await popup_page.wait_for_load_state("networkidle", timeout=20000)
-                except Exception:
-                    await asyncio.sleep(5)
-
-                try:
-                    await popup_page.hover("text=Pessoas", timeout=5000)
-                    await asyncio.sleep(1)
-                    await popup_page.click("text=Cadastro/Consulta", timeout=5000)
+                    await popup_page.goto(
+                        f"{SEBRAE_URL}/crm/consultarcliente",
+                        wait_until="domcontentloaded",
+                        timeout=15000
+                    )
                     await asyncio.sleep(3)
                 except Exception:
-                    try:
-                        await popup_page.goto(
-                            f"{SEBRAE_URL}/crm/consultarcliente",
-                            wait_until="domcontentloaded",
-                            timeout=15000
-                        )
-                        await asyncio.sleep(3)
-                    except Exception:
-                        pass
+                    pass
 
-                url_atual = popup_page.url
-                token = _extrair_token_da_url(url_atual)
-                await browser.close()
-                if token:
-                    return token
-                raise Exception(f"Token nao encontrado na URL: {url_atual}")
-
-            await browser.close()
-            raise Exception("Popup nao detectado")
-
-        except Exception as e:
+            url_atual = popup_page.url
+            token = _extrair_token_da_url(url_atual)
+            if token:
+                return token
+            raise Exception(f"Token nao encontrado na URL: {url_atual}")
+        finally:
             try:
                 await browser.close()
             except Exception:
                 pass
-            raise e
 
 
-def _extrair_token_da_url(url: str) -> str | None:
+async def _fazer_login_e_abrir_smart(p):
+    browser = await p.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage"]
+    )
+    context = await browser.new_context()
+    page = await context.new_page()
+    popup_page = None
+
+    async def handle_popup(popup):
+        nonlocal popup_page
+        popup_page = popup
+
+    context.on("page", handle_popup)
+
+    try:
+        await page.goto(f"{SEBRAE_URL}/SebraePR/login.do", wait_until="domcontentloaded")
+        await asyncio.sleep(2)
+        await page.fill("input[name='usuario']", SEBRAE_USER)
+        await page.fill("input[name='senha']", SEBRAE_PASS)
+        await page.click("input[type='image'][alt='Ok']")
+        await asyncio.sleep(3)
+
+        try:
+            await page.click("input[type='image'][alt='Entrar no Sistema']", timeout=5000)
+        except Exception:
+            pass
+        await asyncio.sleep(3)
+
+        try:
+            await page.click("img[src*='btn_smart']", timeout=5000)
+        except Exception:
+            pass
+        await asyncio.sleep(5)
+
+        if not popup_page:
+            raise Exception("Popup SMART nao detectado")
+
+        try:
+            await popup_page.wait_for_load_state("networkidle", timeout=20000)
+        except Exception:
+            await asyncio.sleep(5)
+
+        return browser, popup_page
+
+    except Exception:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+        raise
+
+
+async def _buscar_codigo_por_cnpj(page, cnpj: str):
+    await page.goto(
+        f"{SEBRAE_URL}/crm/consultarcliente",
+        wait_until="domcontentloaded",
+        timeout=20000,
+    )
+    await asyncio.sleep(2)
+
+    seletores_cnpj = [
+        "input[name*='cnpj' i]",
+        "input[id*='cnpj' i]",
+        "input[name*='documento' i]",
+        "input[id*='documento' i]",
+    ]
+    preenchido = False
+    for sel in seletores_cnpj:
+        try:
+            await page.fill(sel, cnpj, timeout=3000)
+            preenchido = True
+            break
+        except Exception:
+            continue
+    if not preenchido:
+        raise Exception("Campo CNPJ nao encontrado em /crm/consultarcliente")
+
+    seletores_btn = [
+        "input[value*='Consultar' i]",
+        "input[value*='Buscar' i]",
+        "button:has-text('Consultar')",
+        "button:has-text('Buscar')",
+    ]
+    clicado = False
+    for sel in seletores_btn:
+        try:
+            await page.click(sel, timeout=3000)
+            clicado = True
+            break
+        except Exception:
+            continue
+    if not clicado:
+        try:
+            await page.press("input[name*='cnpj' i]", "Enter", timeout=2000)
+            clicado = True
+        except Exception:
+            pass
+    if not clicado:
+        raise Exception("Botao Consultar nao encontrado")
+
+    await asyncio.sleep(3)
+
+    html = await page.content()
+    padroes = [
+        r"detalhar\(['\"](\d+)['\"]\)",
+        r"detalharAgente\(['\"](\d+)['\"]\)",
+        r"codigo=(\d{4,})",
+        r"/agente/(\d{4,})",
+    ]
+    for pat in padroes:
+        m = re.search(pat, html)
+        if m:
+            return m.group(1)
+    return None
+
+
+async def _contar_visitas_pap(page, codigo: str) -> int:
+    padrao = re.compile(
+        r"Intera[c\u00e7][a\u00e3]o Gerada Automaticamente Pelo Registro de Uma Visita Pap",
+        re.IGNORECASE,
+    )
+    base_url = f"{SEBRAE_URL}/crm/historicoRelacionamento/pj/{codigo}"
+
+    await page.goto(base_url, wait_until="domcontentloaded", timeout=20000)
+    await asyncio.sleep(2)
+    html_1 = await page.content()
+    total = len(padrao.findall(html_1))
+
+    pags = [int(m) for m in re.findall(r"pagina=(\d+)", html_1)]
+    max_pag = max(pags) if pags else 1
+    if max_pag > 50:
+        max_pag = 50
+
+    for p_num in range(2, max_pag + 1):
+        await page.goto(
+            f"{base_url}?pagina={p_num}",
+            wait_until="domcontentloaded",
+            timeout=20000,
+        )
+        await asyncio.sleep(1)
+        html_n = await page.content()
+        total += len(padrao.findall(html_n))
+
+    return total
+
+
+def _extrair_token_da_url(url: str):
     match = re.search(r'[?&]token=([a-f0-9\-]{36})', url, re.IGNORECASE)
     return match.group(1) if match else None
