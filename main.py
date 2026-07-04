@@ -404,49 +404,39 @@ async def _buscar_codigo_por_cnpj(page, cnpj: str):
         wait_until="domcontentloaded",
         timeout=20000,
     )
-    await asyncio.sleep(2)
 
-    seletores_cnpj = [
-        "input[name*='cnpj' i]",
-        "input[id*='cnpj' i]",
-        "input[name*='documento' i]",
-        "input[id*='documento' i]",
-    ]
-    preenchido = False
-    for sel in seletores_cnpj:
-        try:
-            await page.fill(sel, cnpj, timeout=3000)
-            preenchido = True
-            break
-        except Exception:
-            continue
-    if not preenchido:
-        raise Exception("Campo CNPJ nao encontrado em /crm/consultarcliente")
+    input_sel = "#input-cnpj input"
+    try:
+        await page.wait_for_selector(input_sel, state="visible", timeout=15000)
+    except Exception:
+        raise Exception("Campo #input-cnpj nao apareceu em /crm/consultarcliente")
+    await asyncio.sleep(1)
 
-    seletores_btn = [
-        "input[value*='Consultar' i]",
-        "input[value*='Buscar' i]",
+    try:
+        await page.click(input_sel, timeout=3000)
+    except Exception:
+        pass
+    await page.type(input_sel, cnpj, delay=80)
+    await asyncio.sleep(1)
+
+    try:
+        await page.press(input_sel, "Enter", timeout=2000)
+    except Exception:
+        pass
+
+    for sel in [
         "button:has-text('Consultar')",
         "button:has-text('Buscar')",
-    ]
-    clicado = False
-    for sel in seletores_btn:
+        "button:has-text('Pesquisar')",
+        "p-button button",
+    ]:
         try:
-            await page.click(sel, timeout=3000)
-            clicado = True
+            await page.click(sel, timeout=1500)
             break
         except Exception:
             continue
-    if not clicado:
-        try:
-            await page.press("input[name*='cnpj' i]", "Enter", timeout=2000)
-            clicado = True
-        except Exception:
-            pass
-    if not clicado:
-        raise Exception("Botao Consultar nao encontrado")
 
-    await asyncio.sleep(3)
+    await asyncio.sleep(4)
 
     html = await page.content()
     padroes = [
@@ -454,6 +444,7 @@ async def _buscar_codigo_por_cnpj(page, cnpj: str):
         r"detalharAgente\(['\"](\d+)['\"]\)",
         r"codigo=(\d{4,})",
         r"/agente/(\d{4,})",
+        r"/pj/(\d{4,})",
     ]
     for pat in padroes:
         m = re.search(pat, html)
