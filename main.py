@@ -399,17 +399,28 @@ async def _fazer_login_e_abrir_smart(p):
 
 
 async def _buscar_codigo_por_cnpj(page, cnpj: str):
+    current_url = page.url
+    token_match = re.search(r"[?&]token=([a-f0-9\-]{36})", current_url, re.IGNORECASE)
+    cod_unidade_match = re.search(r"[?&]codUnidade=(\d+)", current_url, re.IGNORECASE)
+    qs_parts = ["lv=1.1.0"]
+    if token_match:
+        qs_parts.append(f"token={token_match.group(1)}")
+    if cod_unidade_match:
+        qs_parts.append(f"codUnidade={cod_unidade_match.group(1)}")
+    qs = "?" + "&".join(qs_parts)
+
     await page.goto(
-        f"{SEBRAE_URL}/crm/consultarcliente",
-        wait_until="domcontentloaded",
-        timeout=20000,
+        f"{SEBRAE_URL}/crm/consultarcliente{qs}",
+        wait_until="networkidle",
+        timeout=30000,
     )
 
     input_sel = "#input-cnpj input"
     try:
-        await page.wait_for_selector(input_sel, state="visible", timeout=15000)
+        await page.wait_for_selector(input_sel, state="visible", timeout=25000)
     except Exception:
-        raise Exception("Campo #input-cnpj nao apareceu em /crm/consultarcliente")
+        html_snip = (await page.content())[:500]
+        raise Exception(f"Campo #input-cnpj nao apareceu. URL atual: {page.url} | HTML: {html_snip[:300]}")
     await asyncio.sleep(1)
 
     try:
