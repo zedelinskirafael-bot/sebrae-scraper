@@ -287,6 +287,7 @@ async def graduar_cliente_maquina(req: GraduarRequest):
                 if not codigo:
                     return {"sucesso": True, "encontrado": False}
 
+                token = _extrair_token_da_url(popup_page.url)
                 visitas = await _contar_visitas_pap(popup_page, codigo)
             finally:
                 try:
@@ -294,23 +295,64 @@ async def graduar_cliente_maquina(req: GraduarRequest):
                 except Exception:
                     pass
 
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        supabase.table("clientes").update({
+        endereco = await _buscar_endereco_smart(codigo, token) if token else None
+
+        update_payload = {
             "codigo": codigo,
             "visitas_anteriores": visitas,
             "origem": "sebrae",
-        }).eq("id", req.cliente_id).execute()
+        }
+        if endereco:
+            update_payload.update({
+                "cep": endereco.get("cep"),
+                "rua": endereco.get("rua"),
+                "numero": endereco.get("numero"),
+                "complemento": endereco.get("complemento"),
+                "bairro": endereco.get("bairro"),
+                "latitude": endereco.get("latitude"),
+                "longitude": endereco.get("longitude"),
+            })
+
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        supabase.table("clientes").update(update_payload).eq("id", req.cliente_id).execute()
 
         return {
             "sucesso": True,
             "encontrado": True,
             "codigo": codigo,
             "visitas": visitas,
+            "endereco": endereco,
         }
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _buscar_endereco_smart(codigo: str, token: str):
+    try:
+        headers = {"App_key": APP_KEY, "Authorization": token, "Content-Type": "application/json"}
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(f"{SEBRAE_API}/agente/{codigo}", headers=headers)
+            if r.status_code != 200:
+                return None
+            empresa = r.json() or {}
+        endereco = empresa.get("endereco") or {}
+        logradouro = endereco.get("logradouro") or {}
+        bairro_obj = endereco.get("bairro") or {}
+        geo = endereco.get("geoLocalizacao") or {}
+        cep_raw = str(endereco.get("cep") or "") or None
+        return {
+            "cep": cep_raw,
+            "rua": logradouro.get("descricao"),
+            "numero": endereco.get("numero"),
+            "complemento": endereco.get("complemento"),
+            "bairro": bairro_obj.get("descricao"),
+            "latitude": geo.get("latitude"),
+            "longitude": geo.get("longitude"),
+        }
+    except Exception:
+        return None
 
 
 async def get_token() -> str:
