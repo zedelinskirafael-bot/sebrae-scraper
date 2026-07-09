@@ -358,14 +358,14 @@ async def analise_risco(req: ScrapeRequest):
     from datetime import datetime, timedelta
 
     tags = []
-    interacoes_12m = []
+    interacoes = []
     detalhes = {}
 
     def resultado(parou_em=None):
         return {
             "sucesso": True,
             "tags": tags,
-            "interacoes_12m": interacoes_12m,
+            "interacoes": interacoes,
             "detalhes": detalhes,
             "parou_em": parou_em,
         }
@@ -457,7 +457,6 @@ async def analise_risco(req: ScrapeRequest):
 
                     agora = datetime.now()
                     corte_6m = agora - timedelta(days=183)
-                    corte_12m = agora - timedelta(days=365)
 
                     # 5) Mesmo participante ~ mesmo cadastrante
                     for it in lista:
@@ -483,14 +482,15 @@ async def analise_risco(req: ScrapeRequest):
                         descricao = it.get("descricao") or ""
                         cadastrou = (it.get("quemCadastrou") or "").strip().upper()
 
-                        if dt and dt >= corte_12m:
-                            interacoes_12m.append({
-                                "feita_em": it.get("dataInclusao"),
-                                "protocolo": it.get("protocolo"),
-                                "participante": it.get("nomeParticipantes"),
-                                "descricao": (titulo + (" — " if titulo and descricao else "") + descricao)[:400],
-                                "quem_cadastrou": it.get("quemCadastrou"),
-                            })
+                        # Lista COMPLETA de interacoes (detalhe cheio, sem corte de janela)
+                        interacoes.append({
+                            "feita_em": it.get("dataInclusao"),
+                            "protocolo": it.get("protocolo"),
+                            "participante": it.get("nomeParticipantes"),
+                            "titulo": titulo or None,
+                            "descricao": descricao or None,
+                            "quem_cadastrou": it.get("quemCadastrou"),
+                        })
 
                         # 6) Abre email (6 meses, Emanuel Sandri + titulo Digital)
                         if dt and dt >= corte_6m and cadastrou == "EMANUEL SANDRI" \
