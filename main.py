@@ -275,73 +275,97 @@ async def buscar_pesquisas(req: ScrapeRequest):
 
 @app.post("/debug-analise")
 async def debug_analise(req: ScrapeRequest):
-    """TEMPORARIO — descoberta tecnica para a feature Analise de Risco.
-    Despeja dado cru de um cliente real (empresa, socios, historico HTML,
-    e probes de endpoints de qualificadores) para inspecao. Remover depois."""
+    """TEMPORARIO — descoberta tecnica para a feature Analise de Risco (v2).
+    Grampo de rede: captura as chamadas de API que o Smart faz ao navegar
+    pela ficha do cliente e pelo historico. Remover depois."""
     out = {"codigo": req.codigo_cliente}
+    capturas = []
+
+    async def on_response(resp):
+        url = resp.url
+        if "api.pr.sebrae.com.br" not in url:
+            return
+        item = {"url": url, "status": resp.status, "metodo": resp.request.method}
+        try:
+            ct = resp.headers.get("content-type", "")
+            if "json" in ct and resp.status == 200:
+                body = await resp.text()
+                item["body"] = body[:1200]
+        except Exception:
+            pass
+        capturas.append(item)
+
     try:
         async with async_playwright() as p:
             browser, page = await _fazer_login_e_abrir_smart(p)
             try:
-                try:
-                    await page.hover("text=Pessoas", timeout=5000)
-                    await asyncio.sleep(1)
-                    await page.click("text=Cadastro/Consulta", timeout=5000)
-                    await asyncio.sleep(3)
-                except Exception:
-                    pass
-                token = _extrair_token_da_url(page.url)
-                out["token_ok"] = bool(token)
+                page.on("response", on_response)
 
-                headers = {"App_key": APP_KEY, "Authorization": token, "Content-Type": "application/json"}
-                async with httpx.AsyncClient(timeout=30) as client:
-                    r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}", headers=headers)
-                    out["empresa_status"] = r.status_code
-                    out["empresa"] = r.json() if r.status_code == 200 else r.text[:500]
+                # 1) Consulta de cliente — descobrir campos de busca
+                await _abrir_crm_consulta(page)
+                inputs_html = await page.evaluate(
+                    "() => Array.from(document.querySelectorAll('input, p-inputmask, span[id]')).slice(0, 40)"
+                    ".map(e => (e.id || '') + '|' + (e.getAttribute('placeholder') || '') + '|' + e.tagName).join('\\n')"
+                )
+                out["campos_busca"] = inputs_html
 
-                    r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}/vinculo", headers=headers)
-                    out["vinculo_status"] = r.status_code
-                    vinculo = r.json() if r.status_code == 200 else []
-                    out["vinculo"] = vinculo
+                # 2) Buscar por codigo (tentar input de codigo; senao, deixa registrado)
+                achou_input = None
+                for sel in ["#input-codigo input", "#input-codigo", "input[placeholder*='digo']", "#codigo"]:
+                    try:
+                        await page.wait_for_selector(sel, state="visible", timeout=3000)
+                        achou_input = sel
+                        break
+                    except Exception:
+                        continue
+                out["input_codigo"] = achou_input
 
-                    pfs = []
-                    for socio in (vinculo if isinstance(vinculo, list) else [])[:3]:
-                        cod_pf = socio.get("codigo")
-                        if not cod_pf:
-                            continue
-                        rp = await client.get(f"{SEBRAE_API}/agente/{cod_pf}", headers=headers)
-                        pfs.append(rp.json() if rp.status_code == 200 else {"status": rp.status_code})
-                    out["pessoas"] = pfs
-
-                    # Probe: onde moram os qualificadores?
-                    probes = {}
-                    for ep in ["qualificadores", "qualificador", "marcadores",
-                               "classificacoes", "produtos", "relacionamentos", "vinculos"]:
+                if achou_input:
+                    await page.click(achou_input)
+                    await page.type(achou_input, req.codigo_cliente, delay=60)
+                    try:
+                        await page.press(achou_input, "Enter", timeout=2000)
+                    except Exception:
+                        pass
+                    for sel in ["button:has-text('Consultar')", "button:has-text('Pesquisar')", "p-button button"]:
                         try:
-                            rr = await client.get(
-                                f"{SEBRAE_API}/agente/{req.codigo_cliente}/{ep}",
-                                headers=headers,
-                            )
-                            probes[ep] = {
-                                "status": rr.status_code,
-                                "body": (rr.text[:600] if rr.status_code == 200 else None),
-                            }
-                        except Exception as ex:
-                            probes[ep] = {"erro": str(ex)}
-                    out["probes"] = probes
+                            await page.click(sel, timeout=1500)
+                            break
+                        except Exception:
+                            continue
+                    await asyncio.sleep(4)
+                    # clicar na primeira linha do resultado (ou lupa)
+                    for sel in ["tbody tr td a", "tbody tr .ui-row-toggler", "tbody tr td:first-child", "tbody tr"]:
+                        try:
+                            await page.click(sel, timeout=3000)
+                            break
+                        except Exception:
+                            continue
+                    await asyncio.sleep(6)
+                    out["url_apos_clique"] = page.url
+                    html_detalhe = await page.content()
+                    idx = html_detalhe.find("Qualificadores")
+                    out["tem_qualificadores_no_html"] = idx > -1
+                    if idx > -1:
+                        out["trecho_qualificadores"] = html_detalhe[max(0, idx - 200): idx + 3000]
 
-                base_url = f"{SEBRAE_URL}/crm/historicoRelacionamento/pj/{req.codigo_cliente}"
-                await page.goto(base_url, wait_until="domcontentloaded", timeout=20000)
-                await asyncio.sleep(2)
-                out["historico_html"] = await page.content()
+                # 3) Historico de relacionamento (captura XHRs tambem)
+                await page.goto(
+                    f"{SEBRAE_URL}/crm/historicoRelacionamento/pj/{req.codigo_cliente}",
+                    wait_until="domcontentloaded", timeout=20000,
+                )
+                await asyncio.sleep(4)
             finally:
                 try:
                     await browser.close()
                 except Exception:
                     pass
+
+        out["capturas"] = capturas
         return out
     except Exception as e:
         out["erro"] = str(e)
+        out["capturas"] = capturas
         return out
 
 
