@@ -273,6 +273,259 @@ async def buscar_pesquisas(req: ScrapeRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+STOP_NOMES = {"DA", "DE", "DO", "DAS", "DOS", "E"}
+
+
+def _normalizar_nome(nome: str):
+    import unicodedata
+    s = unicodedata.normalize("NFD", nome or "").encode("ascii", "ignore").decode()
+    tokens = re.sub(r"[^A-Za-z ]", " ", s).upper().split()
+    return [t for t in tokens if t not in STOP_NOMES]
+
+
+def _nomes_similares(a: str, b: str) -> bool:
+    """Compara nomes tolerando abreviacoes e nomes intermediarios omitidos.
+    Ex: 'Gilberto Alberton Benvenutti' ~ 'Gilberto Benvenutti' -> True."""
+    ta, tb = _normalizar_nome(a), _normalizar_nome(b)
+    if not ta or not tb:
+        return False
+
+    def tok_match(x, y):
+        if x == y:
+            return True
+        # inicial abreviada: "J" ~ "JOAO"
+        return (len(x) == 1 and y.startswith(x)) or (len(y) == 1 and x.startswith(y))
+
+    curto, longo = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    if not tok_match(curto[0], longo[0]):
+        return False
+    if not tok_match(curto[-1], longo[-1]):
+        return False
+    return all(any(tok_match(t, u) for u in longo) for t in curto)
+
+
+def _parse_data_interacao(s: str):
+    from datetime import datetime
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s.strip()[:16], "%d/%m/%Y %H:%M")
+    except Exception:
+        try:
+            return datetime.strptime(s.strip()[:10], "%d/%m/%Y")
+        except Exception:
+            return None
+
+
+PADRAO_VISITA_PAP = re.compile(
+    r"Intera[cç][aã]o Gerada Automaticamente Pelo Registro de Uma Visita Pap",
+    re.IGNORECASE,
+)
+
+PADRAO_CHECKBOX = re.compile(
+    r'<p-checkbox[^>]*id="(check-[^"]+)"[^>]*label="([^"]*)"(.*?)</p-checkbox>',
+    re.DOTALL,
+)
+
+
+def _extrair_qualificadores(html: str):
+    """Extrai checkboxes da secao 'Qualificadores' (para antes de 'Produtos Sebrae')."""
+    ini = html.find(">Qualificadores<")
+    if ini == -1:
+        ini = html.find("Qualificadores")
+    if ini == -1:
+        return None  # secao nao encontrada
+    fim = html.find("Produtos Sebrae", ini)
+    trecho = html[ini:fim if fim > -1 else ini + 20000]
+    marcados = []
+    for m in PADRAO_CHECKBOX.finditer(trecho):
+        _id, label, corpo = m.group(1), m.group(2), m.group(3)
+        if "ui-state-active" in corpo:
+            marcados.append(label)
+    return marcados
+
+
+@app.post("/analise-risco")
+async def analise_risco(req: ScrapeRequest):
+    """Analise de Risco do cliente no Smart. Sequencia com paradas:
+    1. sem pessoas -> TAG preta (para)   2. email @sebrae -> TAG preta (para)
+    3. porte Medio/Grande -> TAG vermelha (para); sem porte -> amarela (segue)
+    4. qualificador marcado -> TAG preta (para)
+    5. participante ~ quem cadastrou -> TAG preta (para)
+    6. abre email 6m (Emanuel Sandri + titulo Digital) -> amarela (segue)
+    7. interacoes 6m -> amarela + lista 12m (segue)
+    8. visita PAP no ano corrente -> vermelha."""
+    from datetime import datetime, timedelta
+
+    tags = []
+    interacoes_12m = []
+    detalhes = {}
+
+    def resultado(parou_em=None):
+        return {
+            "sucesso": True,
+            "tags": tags,
+            "interacoes_12m": interacoes_12m,
+            "detalhes": detalhes,
+            "parou_em": parou_em,
+        }
+
+    try:
+        async with async_playwright() as p:
+            browser, page = await _fazer_login_e_abrir_smart(p)
+            try:
+                await _abrir_crm_consulta(page)
+                token = _extrair_token_da_url(page.url)
+                if not token:
+                    raise Exception(f"Token nao encontrado na URL: {page.url}")
+                headers = {"App_key": APP_KEY, "Authorization": token, "Content-Type": "application/json"}
+
+                async with httpx.AsyncClient(timeout=40) as client:
+                    # 1) Pessoas cadastradas
+                    r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}/vinculo", headers=headers)
+                    vinculo = r.json() if r.status_code == 200 and r.text else []
+                    if not isinstance(vinculo, list):
+                        vinculo = []
+                    detalhes["num_pessoas"] = len(vinculo)
+                    if len(vinculo) == 0:
+                        tags.append({"id": "sem_pessoas", "label": "Sem pessoas cadastradas", "cor": "preta"})
+                        return resultado("pessoas")
+
+                    # 2) Emails com @sebrae (empresa + cada pessoa)
+                    emails = []
+                    r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}", headers=headers)
+                    empresa = r.json() if r.status_code == 200 else {}
+                    for em in (empresa.get("emails") or []):
+                        if em.get("email"):
+                            emails.append(em["email"])
+                    for socio in vinculo:
+                        cod_pf = socio.get("codigo")
+                        if not cod_pf:
+                            continue
+                        rp = await client.get(f"{SEBRAE_API}/agente/{cod_pf}", headers=headers)
+                        pf = rp.json() if rp.status_code == 200 else {}
+                        for em in (pf.get("emails") or []):
+                            if em.get("email"):
+                                emails.append(em["email"])
+                    detalhes["emails_verificados"] = emails
+                    achado = next((e for e in emails if "@sebrae" in e.lower()), None)
+                    if achado:
+                        tags.append({"id": "email_sebrae", "label": "@sebrae", "cor": "preta", "detalhe": achado})
+                        return resultado("email")
+
+                    # 3) Porte
+                    r = await client.get(f"{SEBRAE_API}/pj/{req.codigo_cliente}", headers=headers)
+                    pj = r.json() if r.status_code == 200 else {}
+                    porte_desc = ((pj.get("porte") or {}).get("descricao")) or ""
+                    detalhes["porte"] = porte_desc or None
+                    if porte_desc:
+                        p_upper = porte_desc.upper()
+                        ok = p_upper.startswith("MICRO") or p_upper.startswith("PEQUENO") \
+                            or p_upper.startswith("EMPREENDEDOR INDIVIDUAL")
+                        if not ok:
+                            tags.append({"id": "porte", "label": "Problema no porte", "cor": "vermelha",
+                                         "detalhe": porte_desc})
+                            return resultado("porte")
+                    else:
+                        tags.append({"id": "sem_porte", "label": "Sem porte", "cor": "amarela"})
+
+                    # 4) Qualificadores (pagina de edicao do cadastro)
+                    await page.goto(
+                        f"{SEBRAE_URL}/crm/cadastrarPessoaJuridica/{req.codigo_cliente}",
+                        wait_until="domcontentloaded", timeout=25000,
+                    )
+                    await asyncio.sleep(6)
+                    html_edit = await page.content()
+                    marcados = _extrair_qualificadores(html_edit)
+                    detalhes["qualificadores_marcados"] = marcados
+                    if marcados is None:
+                        raise Exception("Secao Qualificadores nao encontrada na pagina de edicao")
+                    if marcados:
+                        tags.append({"id": "qualificadores", "label": "Tem qualificadores", "cor": "preta",
+                                     "detalhe": ", ".join(marcados)})
+                        return resultado("qualificadores")
+
+                    # 5-8) Interacoes do historico de relacionamento
+                    r = await client.put(
+                        f"{SEBRAE_API}/historico/relacionamentoSmart/{req.codigo_cliente}",
+                        headers=headers, content="",
+                    )
+                    hist = r.json() if r.status_code == 200 and r.text else {}
+                    lista = hist.get("listaHistoricoInteracao") or []
+                    detalhes["total_interacoes"] = lista[0].get("total") if lista else 0
+                    detalhes["interacoes_recebidas"] = len(lista)
+
+                    agora = datetime.now()
+                    corte_6m = agora - timedelta(days=183)
+                    corte_12m = agora - timedelta(days=365)
+
+                    # 5) Mesmo participante ~ mesmo cadastrante
+                    for it in lista:
+                        participantes = (it.get("nomeParticipantes") or "")
+                        cadastrou = (it.get("quemCadastrou") or "")
+                        for parte in re.split(r"[,;/]", participantes):
+                            if parte.strip() and _nomes_similares(parte, cadastrou):
+                                tags.append({
+                                    "id": "mesmo_participante",
+                                    "label": "Mesmo participante, mesmo cadastrante",
+                                    "cor": "preta",
+                                    "detalhe": f"{parte.strip()} ~ {cadastrou} em {it.get('dataInclusao')}",
+                                })
+                                return resultado("mesmo_participante")
+
+                    abre_email = False
+                    tem_interacao_6m = False
+                    visita_pap_ano = None
+
+                    for it in lista:
+                        dt = _parse_data_interacao(it.get("dataInclusao"))
+                        titulo = it.get("titulo") or ""
+                        descricao = it.get("descricao") or ""
+                        cadastrou = (it.get("quemCadastrou") or "").strip().upper()
+
+                        if dt and dt >= corte_12m:
+                            interacoes_12m.append({
+                                "feita_em": it.get("dataInclusao"),
+                                "protocolo": it.get("protocolo"),
+                                "participante": it.get("nomeParticipantes"),
+                                "descricao": (titulo + (" — " if titulo and descricao else "") + descricao)[:400],
+                                "quem_cadastrou": it.get("quemCadastrou"),
+                            })
+
+                        # 6) Abre email (6 meses, Emanuel Sandri + titulo Digital)
+                        if dt and dt >= corte_6m and cadastrou == "EMANUEL SANDRI" \
+                                and titulo.upper().startswith("DIGITAL"):
+                            abre_email = True
+
+                        # 7) Qualquer interacao nos ultimos 6 meses
+                        if dt and dt >= corte_6m:
+                            tem_interacao_6m = True
+
+                        # 8) Visita PAP no ano corrente
+                        if PADRAO_VISITA_PAP.search(descricao) or PADRAO_VISITA_PAP.search(titulo):
+                            if dt and dt.year == agora.year and visita_pap_ano is None:
+                                visita_pap_ano = it.get("dataInclusao")
+
+                    if abre_email:
+                        tags.append({"id": "abre_email", "label": "Abre email", "cor": "amarela"})
+                    if tem_interacao_6m:
+                        tags.append({"id": "interacoes", "label": "Interações", "cor": "amarela"})
+                    if visita_pap_ano:
+                        tags.append({"id": "ja_teve_pap", "label": "Já teve porta a porta", "cor": "vermelha",
+                                     "detalhe": visita_pap_ano})
+
+                    return resultado(None)
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/debug-analise")
 async def debug_analise(req: ScrapeRequest):
     """TEMPORARIO — descoberta tecnica para a feature Analise de Risco (v2).
