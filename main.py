@@ -287,10 +287,16 @@ async def debug_analise(req: ScrapeRequest):
             return
         item = {"url": url, "status": resp.status, "metodo": resp.request.method}
         try:
+            if resp.request.method in ("PUT", "POST"):
+                item["request_body"] = (resp.request.post_data or "")[:800]
+        except Exception:
+            pass
+        try:
             ct = resp.headers.get("content-type", "")
             if "json" in ct and resp.status == 200:
                 body = await resp.text()
-                item["body"] = body[:1200]
+                limite = 8000 if any(x in url for x in ["/pj/", "relacionamentoSmart", "qualific"]) else 1200
+                item["body"] = body[:limite]
         except Exception:
             pass
         capturas.append(item)
@@ -311,7 +317,7 @@ async def debug_analise(req: ScrapeRequest):
 
                 # 2) Buscar por codigo (tentar input de codigo; senao, deixa registrado)
                 achou_input = None
-                for sel in ["#input-codigo input", "#input-codigo", "input[placeholder*='digo']", "#codigo"]:
+                for sel in ["#input-cod input", "#input-cod", "#input-codigo input", "input[placeholder*='digo']"]:
                     try:
                         await page.wait_for_selector(sel, state="visible", timeout=3000)
                         achou_input = sel
