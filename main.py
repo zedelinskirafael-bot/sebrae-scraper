@@ -279,6 +279,7 @@ async def debug_analise(req: ScrapeRequest):
     Grampo de rede: captura as chamadas de API que o Smart faz ao navegar
     pela ficha do cliente e pelo historico. Remover depois."""
     out = {"codigo": req.codigo_cliente}
+    cod_nav = req.codigo_cliente.split(",")[0].strip()
     capturas = []
 
     async def on_response(resp):
@@ -328,7 +329,7 @@ async def debug_analise(req: ScrapeRequest):
 
                 if achou_input:
                     await page.click(achou_input)
-                    await page.type(achou_input, req.codigo_cliente, delay=60)
+                    await page.type(achou_input, cod_nav, delay=60)
                     try:
                         await page.press(achou_input, "Enter", timeout=2000)
                     except Exception:
@@ -355,12 +356,61 @@ async def debug_analise(req: ScrapeRequest):
                     if idx > -1:
                         out["trecho_qualificadores"] = html_detalhe[max(0, idx - 200): idx + 3000]
 
-                # 3) Historico de relacionamento (captura XHRs tambem)
-                await page.goto(
-                    f"{SEBRAE_URL}/crm/historicoRelacionamento/pj/{req.codigo_cliente}",
-                    wait_until="domcontentloaded", timeout=20000,
-                )
-                await asyncio.sleep(4)
+                # 2b) Tentar abrir tela de EDICAO do cadastro (onde moram os Qualificadores)
+                if achou_input:
+                    for sel in ["button:has-text('Alterar')", "a:has-text('Alterar')",
+                                "[title*='Editar']", "[title*='Alterar']",
+                                "i.material-icons:has-text('create')", "i.material-icons:has-text('edit')",
+                                "img[src*='editar']", "img[src*='alterar']",
+                                "tbody tr td a:has(i)", "tbody tr button"]:
+                        try:
+                            await page.click(sel, timeout=2500)
+                            out["clique_editar"] = sel
+                            break
+                        except Exception:
+                            continue
+                    await asyncio.sleep(6)
+                    out["url_apos_editar"] = page.url
+                    html_edit = await page.content()
+                    idx = html_edit.find("Qualificadores")
+                    out["qualificadores_na_edicao"] = idx > -1
+                    if idx > -1:
+                        out["trecho_qualificadores"] = html_edit[max(0, idx - 300): idx + 4000]
+
+                # 3) Porte dos codigos extras + probes de qualificadores (via API direta)
+                token = _extrair_token_da_url(page.url) or _extrair_token_da_url(out.get("url_apos_clique") or "")
+                if token:
+                    headers = {"App_key": APP_KEY, "Authorization": token, "Content-Type": "application/json"}
+                    codigos = [c.strip() for c in req.codigo_cliente.split(",") if c.strip()]
+                    async with httpx.AsyncClient(timeout=30) as client:
+                        portes = {}
+                        for cod in codigos:
+                            try:
+                                r = await client.get(f"{SEBRAE_API}/pj/{cod}", headers=headers)
+                                j = r.json() if r.status_code == 200 else {}
+                                portes[cod] = {
+                                    "porte": j.get("porte"),
+                                    "indicadorEmpresa": j.get("indicadorEmpresa"),
+                                    "nomeFantasia": j.get("nomeFantasia"),
+                                }
+                            except Exception as ex:
+                                portes[cod] = {"erro": str(ex)}
+                        out["portes"] = portes
+
+                        probes = {}
+                        cod0 = codigos[0]
+                        for ep in [f"pj/{cod0}/qualificador", f"pj/{cod0}/qualificadores",
+                                   f"qualificador/{cod0}", f"qualificadores/{cod0}",
+                                   f"agente/{cod0}/qualificador", f"agente/{cod0}/qualificadores",
+                                   f"pj/{cod0}/produto-sebrae", f"pj/{cod0}/produtos-sebrae",
+                                   f"agente/{cod0}/marcador", "qualificador", "qualificadores"]:
+                            try:
+                                rr = await client.get(f"{SEBRAE_API}/{ep}", headers=headers)
+                                probes[ep] = {"status": rr.status_code,
+                                              "body": rr.text[:500] if rr.status_code == 200 else None}
+                            except Exception as ex:
+                                probes[ep] = {"erro": str(ex)}
+                        out["probes_qualificadores"] = probes
             finally:
                 try:
                     await browser.close()
