@@ -385,8 +385,15 @@ async def analise_risco(req: ScrapeRequest):
         async with async_playwright() as p:
             browser, page = await _fazer_login_e_abrir_smart(p)
             try:
-                await _abrir_crm_consulta(page)
+                # O token ja costuma estar na URL logo apos o login.
+                # So navega pelo menu se nao achar de primeira.
                 token = _extrair_token_da_url(page.url)
+                if not token:
+                    try:
+                        await _abrir_crm_consulta(page)
+                    except Exception:
+                        pass
+                    token = _extrair_token_da_url(page.url)
                 if not token:
                     raise Exception(f"Token nao encontrado na URL: {page.url}")
                 headers = {"App_key": APP_KEY, "Authorization": token, "Content-Type": "application/json"}
