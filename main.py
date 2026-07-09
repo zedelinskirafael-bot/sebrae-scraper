@@ -304,6 +304,17 @@ def _nomes_similares(a: str, b: str) -> bool:
     return all(any(tok_match(t, u) for u in longo) for t in curto)
 
 
+def _parse_data_abertura(s: str):
+    """Data de abertura vem como '2025-05-01 00:00:00' ou '2025-05-01'."""
+    from datetime import datetime
+    if not s:
+        return None
+    try:
+        return datetime.strptime(str(s).strip()[:10], "%Y-%m-%d")
+    except Exception:
+        return None
+
+
 def _parse_data_interacao(s: str):
     from datetime import datetime
     if not s:
@@ -381,6 +392,23 @@ async def analise_risco(req: ScrapeRequest):
                 headers = {"App_key": APP_KEY, "Authorization": token, "Content-Type": "application/json"}
 
                 async with httpx.AsyncClient(timeout=40) as client:
+                    # 0) Idade da empresa (menos de 1 ano para tudo)
+                    r = await client.get(f"{SEBRAE_API}/pj/{req.codigo_cliente}", headers=headers)
+                    pj = r.json() if r.status_code == 200 else {}
+                    abertura = _parse_data_abertura(pj.get("dataAberturaNascimento"))
+                    detalhes["data_abertura"] = pj.get("dataAberturaNascimento")
+                    if abertura:
+                        idade_dias = (datetime.now() - abertura).days
+                        detalhes["idade_meses"] = round(idade_dias / 30.4)
+                        if idade_dias < 365:
+                            tags.append({
+                                "id": "menos_1_ano",
+                                "label": "Menos de 1 ano",
+                                "cor": "vermelha",
+                                "detalhe": f"Aberta em {abertura.strftime('%d/%m/%Y')} — empresa com menos de 1 ano",
+                            })
+                            return resultado("idade")
+
                     # 1) Pessoas cadastradas
                     r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}/vinculo", headers=headers)
                     vinculo = r.json() if r.status_code == 200 and r.text else []
@@ -413,9 +441,7 @@ async def analise_risco(req: ScrapeRequest):
                         tags.append({"id": "email_sebrae", "label": "@sebrae", "cor": "preta", "detalhe": achado})
                         return resultado("email")
 
-                    # 3) Porte
-                    r = await client.get(f"{SEBRAE_API}/pj/{req.codigo_cliente}", headers=headers)
-                    pj = r.json() if r.status_code == 200 else {}
+                    # 3) Porte (reusa o pj ja buscado no passo 0)
                     porte_desc = ((pj.get("porte") or {}).get("descricao")) or ""
                     detalhes["porte"] = porte_desc or None
                     if porte_desc:
