@@ -273,6 +273,78 @@ async def buscar_pesquisas(req: ScrapeRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/debug-analise")
+async def debug_analise(req: ScrapeRequest):
+    """TEMPORARIO — descoberta tecnica para a feature Analise de Risco.
+    Despeja dado cru de um cliente real (empresa, socios, historico HTML,
+    e probes de endpoints de qualificadores) para inspecao. Remover depois."""
+    out = {"codigo": req.codigo_cliente}
+    try:
+        async with async_playwright() as p:
+            browser, page = await _fazer_login_e_abrir_smart(p)
+            try:
+                try:
+                    await page.hover("text=Pessoas", timeout=5000)
+                    await asyncio.sleep(1)
+                    await page.click("text=Cadastro/Consulta", timeout=5000)
+                    await asyncio.sleep(3)
+                except Exception:
+                    pass
+                token = _extrair_token_da_url(page.url)
+                out["token_ok"] = bool(token)
+
+                headers = {"App_key": APP_KEY, "Authorization": token, "Content-Type": "application/json"}
+                async with httpx.AsyncClient(timeout=30) as client:
+                    r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}", headers=headers)
+                    out["empresa_status"] = r.status_code
+                    out["empresa"] = r.json() if r.status_code == 200 else r.text[:500]
+
+                    r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}/vinculo", headers=headers)
+                    out["vinculo_status"] = r.status_code
+                    vinculo = r.json() if r.status_code == 200 else []
+                    out["vinculo"] = vinculo
+
+                    pfs = []
+                    for socio in (vinculo if isinstance(vinculo, list) else [])[:3]:
+                        cod_pf = socio.get("codigo")
+                        if not cod_pf:
+                            continue
+                        rp = await client.get(f"{SEBRAE_API}/agente/{cod_pf}", headers=headers)
+                        pfs.append(rp.json() if rp.status_code == 200 else {"status": rp.status_code})
+                    out["pessoas"] = pfs
+
+                    # Probe: onde moram os qualificadores?
+                    probes = {}
+                    for ep in ["qualificadores", "qualificador", "marcadores",
+                               "classificacoes", "produtos", "relacionamentos", "vinculos"]:
+                        try:
+                            rr = await client.get(
+                                f"{SEBRAE_API}/agente/{req.codigo_cliente}/{ep}",
+                                headers=headers,
+                            )
+                            probes[ep] = {
+                                "status": rr.status_code,
+                                "body": (rr.text[:600] if rr.status_code == 200 else None),
+                            }
+                        except Exception as ex:
+                            probes[ep] = {"erro": str(ex)}
+                    out["probes"] = probes
+
+                base_url = f"{SEBRAE_URL}/crm/historicoRelacionamento/pj/{req.codigo_cliente}"
+                await page.goto(base_url, wait_until="domcontentloaded", timeout=20000)
+                await asyncio.sleep(2)
+                out["historico_html"] = await page.content()
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+        return out
+    except Exception as e:
+        out["erro"] = str(e)
+        return out
+
+
 @app.post("/graduar-cliente-maquina")
 async def graduar_cliente_maquina(req: GraduarRequest):
     cnpj = re.sub(r"\D", "", req.cnpj or "")
