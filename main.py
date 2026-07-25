@@ -150,7 +150,13 @@ async def buscar_cliente(req: ScrapeRequest):
                 emails_pf = [
                     em.get("email") for em in (pf.get("emails") or []) if em.get("email")
                 ]
-                socios_info.append({"pessoa_id": pessoa_id, "emails": emails_pf})
+                socios_info.append({
+                    "pessoa_id": pessoa_id,
+                    "emails": emails_pf,
+                    "_cod_pf": cod_pf,
+                    "_emails_raw": pf.get("emails"),
+                    "_pf_keys": list(pf.keys()) if isinstance(pf, dict) else None,
+                })
                 pessoas_salvas.append(pf.get("nome") or str(cod_pf))
 
         # Fallback cruzado empresa <-> socio (avalia o estado ORIGINAL):
@@ -190,6 +196,14 @@ async def buscar_cliente(req: ScrapeRequest):
             "sucesso": True,
             "empresa": empresa.get("nomeFantasia") or empresa.get("nome"),
             "socios": pessoas_salvas,
+            "_debug": {
+                "empresa_emails_raw": empresa.get("emails"),
+                "empresa_keys": list(empresa.keys()) if isinstance(empresa, dict) else None,
+                "socios": [
+                    {"cod_pf": s.get("_cod_pf"), "emails_raw": s.get("_emails_raw"), "pf_keys": s.get("_pf_keys")}
+                    for s in socios_info
+                ],
+            },
         }
 
     except Exception as e:
