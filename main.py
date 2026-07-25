@@ -110,18 +110,13 @@ async def buscar_cliente(req: ScrapeRequest):
                     "tipo": "empresa",
                 }).execute()
 
-        for em in (empresa.get("emails") or []):
-            endereco_email = em.get("email")
-            if endereco_email:
-                supabase.table("emails").insert({
-                    "organizacao_id": org_id,
-                    "usuario_id": user_id,
-                    "referencia_id": req.cliente_id,
-                    "endereco": endereco_email,
-                    "tipo": "empresa",
-                }).execute()
+        # Emails da empresa (originais) — inseridos depois, junto do fallback cruzado
+        emails_empresa = [
+            em.get("email") for em in (empresa.get("emails") or []) if em.get("email")
+        ]
 
         pessoas_salvas = []
+        socios_info = []  # [{"pessoa_id": ..., "emails": [...]}]
         async with httpx.AsyncClient(timeout=30) as client:
             for socio in (socios if isinstance(socios, list) else []):
                 cod_pf = socio.get("codigo")
@@ -152,18 +147,44 @@ async def buscar_cliente(req: ScrapeRequest):
                             "tipo": "socio",
                         }).execute()
 
-                for em in (pf.get("emails") or []):
-                    endereco_email = em.get("email")
-                    if endereco_email and pessoa_id:
-                        supabase.table("emails").insert({
-                            "organizacao_id": org_id,
-                            "usuario_id": user_id,
-                            "referencia_id": pessoa_id,
-                            "endereco": endereco_email,
-                            "tipo": "socio",
-                        }).execute()
-
+                emails_pf = [
+                    em.get("email") for em in (pf.get("emails") or []) if em.get("email")
+                ]
+                socios_info.append({"pessoa_id": pessoa_id, "emails": emails_pf})
                 pessoas_salvas.append(pf.get("nome") or str(cod_pf))
+
+        # Fallback cruzado empresa <-> socio (avalia o estado ORIGINAL):
+        # - empresa sem email  -> pega do 1o socio (na ordem) que tiver
+        # - socio sem email    -> pega do email original da empresa
+        # Nao copia email de um socio para outro socio.
+        email_empresa_orig = emails_empresa[0] if emails_empresa else None
+        email_socio_disp = next((s["emails"][0] for s in socios_info if s["emails"]), None)
+        if not email_empresa_orig and email_socio_disp:
+            emails_empresa = [email_socio_disp]
+
+        for endereco_email in emails_empresa:
+            supabase.table("emails").insert({
+                "organizacao_id": org_id,
+                "usuario_id": user_id,
+                "referencia_id": req.cliente_id,
+                "endereco": endereco_email,
+                "tipo": "empresa",
+            }).execute()
+
+        for s in socios_info:
+            if not s["pessoa_id"]:
+                continue
+            lista_emails = s["emails"]
+            if not lista_emails and email_empresa_orig:
+                lista_emails = [email_empresa_orig]
+            for endereco_email in lista_emails:
+                supabase.table("emails").insert({
+                    "organizacao_id": org_id,
+                    "usuario_id": user_id,
+                    "referencia_id": s["pessoa_id"],
+                    "endereco": endereco_email,
+                    "tipo": "socio",
+                }).execute()
 
         return {
             "sucesso": True,
