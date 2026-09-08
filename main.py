@@ -603,6 +603,7 @@ async def graduar_cliente_maquina(req: GraduarRequest):
                     pass
 
         endereco = await _buscar_endereco_smart(codigo, token) if token else None
+        pap_data = await _teve_pap_ano_corrente(codigo, token) if token else None
 
         update_payload = {
             "codigo": codigo,
@@ -629,6 +630,8 @@ async def graduar_cliente_maquina(req: GraduarRequest):
             "codigo": codigo,
             "visitas": visitas,
             "endereco": endereco,
+            "pap_ano_corrente": bool(pap_data),
+            "pap_data": pap_data,
         }
     except HTTPException:
         raise
@@ -658,6 +661,32 @@ async def _buscar_endereco_smart(codigo: str, token: str):
             "latitude": geo.get("latitude"),
             "longitude": geo.get("longitude"),
         }
+    except Exception:
+        return None
+
+
+async def _teve_pap_ano_corrente(codigo: str, token: str):
+    """Retorna a data (str) da 1a Visita PAP registrada no ano corrente, ou None.
+    Mesma logica do passo 8 de /analise-risco, isolada para o fluxo da Maquina de Vendas."""
+    from datetime import datetime
+    try:
+        headers = {"App_key": APP_KEY, "Authorization": token, "Content-Type": "application/json"}
+        async with httpx.AsyncClient(timeout=40) as client:
+            r = await client.put(
+                f"{SEBRAE_API}/historico/relacionamentoSmart/{codigo}",
+                headers=headers, content="",
+            )
+        hist = r.json() if r.status_code == 200 and r.text else {}
+        lista = hist.get("listaHistoricoInteracao") or []
+        ano = datetime.now().year
+        for it in lista:
+            titulo = it.get("titulo") or ""
+            descricao = it.get("descricao") or ""
+            if PADRAO_VISITA_PAP.search(descricao) or PADRAO_VISITA_PAP.search(titulo):
+                dt = _parse_data_interacao(it.get("dataInclusao"))
+                if dt and dt.year == ano:
+                    return it.get("dataInclusao")
+        return None
     except Exception:
         return None
 
