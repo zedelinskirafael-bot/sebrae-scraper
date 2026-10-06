@@ -1,5 +1,5 @@
 // Vigia de O.S. do Portal Sebrae de credenciados.
-// Roda a cada 30 min (systemd timer na KVM8), pede ao scraper a lista de
+// Roda a cada 15 min (systemd timer na KVM8), pede ao scraper a lista de
 // Contratacao > Consultar Os, compara com o que ja viu (tabela
 // sebrae_os_vistas, banco apollo) e avisa no WhatsApp (Evolution, instancia
 // claudinho) quando aparece O.S. nova ou quando o "Fluxo atual" muda.

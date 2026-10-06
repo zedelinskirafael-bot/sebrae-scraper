@@ -1,7 +1,7 @@
 # Vigia de O.S. — Portal Sebrae de credenciados
 
 O portal do Sebrae não avisa quando cai uma O.S. nova para aceite. Este vigia olha
-**Contratação › Consultar Os** a cada 30 min e manda WhatsApp quando aparece O.S.
+**Contratação › Consultar Os** a cada 15 min e manda WhatsApp quando aparece O.S.
 nova ou quando o "Fluxo atual" de uma O.S. muda (ex.: Pendente → Aprovada). O prazo de
 aceite é de **3 horas**; depois a O.S. vai para outra empresa, por isso a urgência.
 
@@ -18,7 +18,7 @@ senha dela na VPS, igual à dele já está (`/opt/ia-hub/.env`, usada pelo scrap
 |------|------|-------|
 | `GET /os-credenciado` | contêiner `sebrae-scraper` (porta 127.0.0.1:8001) | Login → botão Portal do Credenciado (aba nova) → Consultar Os → devolve as linhas da tabela |
 | `vigia.js` | `/opt/sebrae-os-vigia` | Compara com `sebrae_os_vistas`, avisa pela Evolution (`claudinho`) |
-| `sebrae-os-vigia.timer` | systemd | A cada 30 min; o script só trabalha seg–sáb 7h–21h BRT |
+| `sebrae-os-vigia.timer` | systemd | A cada 15 min (prazo de aceite 3h, pior caso sobra 2h45); o script só trabalha seg–sáb 7h–21h BRT |
 | `sebrae_os_vistas`, `sebrae_os_vigia_estado` | banco `apollo` | O que já foi visto + contador de falhas |
 
 Log: `/var/log/sebrae-os-vigia.log`.
