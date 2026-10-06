@@ -1,0 +1,9 @@
+{
+  "name": "sebrae-os-vigia",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Vigia de O.S. do Portal Sebrae de credenciados: a cada 30 min compara Consultar Os com o que ja viu e avisa no WhatsApp",
+  "main": "vigia.js",
+  "scripts": { "start": "node vigia.js" },
+  "dependencies": { "pg": "^8.11.3" }
+}

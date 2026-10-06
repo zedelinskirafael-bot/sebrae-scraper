@@ -1,0 +1,10 @@
+[Unit]
+Description=Roda o vigia de O.S. Sebrae a cada 30 min (o script decide a janela seg-sab 7h-21h BRT)
+
+[Timer]
+OnCalendar=*-*-* *:00/30:00
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

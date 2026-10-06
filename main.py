@@ -15,6 +15,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# A conta do Sebrae tem SESSAO UNICA (Decisao 4 do Apollo): dois logins
+# simultaneos derrubam um ao outro. Toda rota que abre navegador passa por
+# esta trava, uma de cada vez. Quem chama em serie (worker, motor) nao sente;
+# quem chegar junto (vigia de O.S.) espera a vez.
+SMART_LOCK = asyncio.Lock()
+ROTAS_COM_NAVEGADOR = {
+    "/buscar-cliente", "/buscar-pesquisas", "/analise-risco",
+    "/graduar-cliente-maquina", "/os-credenciado", "/debug-login",
+}
+
+
+@app.middleware("http")
+async def _serializar_sessao_sebrae(request, call_next):
+    if request.url.path in ROTAS_COM_NAVEGADOR:
+        async with SMART_LOCK:
+            return await call_next(request)
+    return await call_next(request)
+
+
 SEBRAE_URL = "https://app2.pr.sebrae.com.br"
 SEBRAE_API = "https://api.pr.sebrae.com.br/crm-api"
 BANCO_PERGUNTAS_API = "https://api.pr.sebrae.com.br/banco-perguntas-api"
@@ -54,6 +73,111 @@ async def debug_login():
         return {"sucesso": True, "log": log}
     except Exception as e:
         return {"sucesso": False, "log": log, "erro": str(e)}
+
+
+@app.get("/os-credenciado")
+async def os_credenciado():
+    """Lista as O.S. do usuario no Portal de Empresas Credenciadas
+    (Contratacao > Consultar Os). Consumido pelo vigia de O.S. (vigia-os/),
+    que compara com o que ja viu e avisa no WhatsApp."""
+    try:
+        async with async_playwright() as p:
+            browser, context, page = await _login_menu_geral(p)
+            try:
+                portal = await _abrir_portal_credenciado(context, page)
+                linhas = await _ler_consultar_os(portal)
+                try:
+                    await portal.goto(f"{SEBRAE_URL}/credenciado/Logout.do", timeout=15000)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+        return {"sucesso": True, "os": linhas}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"portal credenciado: {e}")
+
+
+async def _abrir_portal_credenciado(context, page):
+    """No MENU GERAL, o botao 'Portal do Credenciado' (RedirecionaPCR.do) abre
+    o portal em ABA NOVA com o token do SAS. Ir direto na URL nao funciona:
+    cai na tela de login do SAS."""
+    async with context.expect_page(timeout=20000) as nova:
+        await page.click("a[href*='RedirecionaPCR']", timeout=10000)
+    portal = await nova.value
+    try:
+        await portal.wait_for_load_state("networkidle", timeout=30000)
+    except Exception:
+        await asyncio.sleep(5)
+    if "/credenciado/" not in portal.url:
+        raise Exception(f"portal do credenciado nao abriu (url={portal.url})")
+    return portal
+
+
+_JS_TABELA_OS = """
+() => {
+  const limpar = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const ehOS = (s) => /^\\d{2}[A-Z]{2,4}\\d{4,}$/.test(limpar(s));
+  const tabelas = [...document.querySelectorAll('table')];
+  const comCabecalho = tabelas.filter(t => /Fluxo atual/i.test(t.textContent));
+  const t = comCabecalho.pop();
+  const saida = [];
+  if (t) {
+    const linhaCab = [...t.rows].find(r => /Fluxo atual/i.test(r.textContent) && r.cells.length >= 6);
+    if (linhaCab) {
+      const cab = [...linhaCab.cells].map(c => limpar(c.innerText).toLowerCase());
+      const idx = (p) => cab.findIndex(h => h.startsWith(p));
+      for (const r of t.rows) {
+        if (r === linhaCab || r.cells.length < 6) continue;
+        const c = [...r.cells].map(x => limpar(x.innerText));
+        if (!ehOS(c[idx('os')])) continue;
+        saida.push({
+          data: c[idx('data')], os: c[idx('os')], solicitante: c[idx('solicitante')],
+          equipe: c[idx('equipe')], empresa: c[idx('empresa')], objeto: c[idx('obj')],
+          fluxo: c[idx('fluxo')], valor: c[idx('valor')],
+        });
+      }
+    }
+  }
+  if (saida.length) return saida;
+  // Plano B: cabecalho e corpo em tabelas separadas -> posicional.
+  for (const tb of tabelas) {
+    for (const r of tb.rows) {
+      if (r.cells.length < 8) continue;
+      const c = [...r.cells].map(x => limpar(x.innerText));
+      if (!ehOS(c[1])) continue;
+      saida.push({ data: c[0], os: c[1], solicitante: c[2], equipe: c[3],
+                   empresa: c[4], objeto: c[5], fluxo: c[6], valor: c[7] });
+    }
+  }
+  return saida;
+}
+"""
+
+
+async def _ler_consultar_os(portal):
+    """Contratacao (hover) > Consultar Os. A lista chega por POST GoConsultarOS.do
+    dentro da mesma pagina (URL nao muda), ordenada da mais recente para a mais
+    antiga, 10 por pagina -- O.S. nova sempre aparece na primeira pagina."""
+    await portal.hover("text=Contratação", timeout=10000)
+    await asyncio.sleep(1)
+    async with portal.expect_response(lambda r: "GoConsultarOS" in r.url, timeout=30000):
+        await portal.click("text=Consultar Os", timeout=10000)
+    await portal.wait_for_selector("text=Fluxo atual", timeout=30000)
+    await asyncio.sleep(2)
+    linhas = await portal.evaluate(_JS_TABELA_OS)
+    if not linhas:
+        texto = await portal.evaluate("() => document.body.innerText")
+        m = re.search(r"(\d+)\s+Resultados", texto)
+        if not m:
+            raise Exception("tela Consultar Os nao carregou a lista")
+        if int(m.group(1)) > 0:
+            # O portal diz que ha linhas e o parser nao achou nenhuma:
+            # layout mudou. Falhar alto, nunca devolver [] como sucesso.
+            raise Exception(f"portal mostra {m.group(1)} resultados mas nenhum foi lido (layout mudou?)")
+    return linhas
 
 
 @app.post("/buscar-cliente")
@@ -723,21 +847,15 @@ async def get_token() -> str:
                 pass
 
 
-async def _fazer_login_e_abrir_smart(p):
+async def _login_menu_geral(p):
+    """Abre o navegador, faz login no SebraePR e entra na unidade.
+    Devolve (browser, context, page) parado no MENU GERAL."""
     browser = await p.chromium.launch(
         headless=True,
         args=["--no-sandbox", "--disable-dev-shm-usage"]
     )
     context = await browser.new_context()
     page = await context.new_page()
-    popup_page = None
-
-    async def handle_popup(popup):
-        nonlocal popup_page
-        popup_page = popup
-
-    context.on("page", handle_popup)
-
     try:
         await page.goto(f"{SEBRAE_URL}/SebraePR/login.do", wait_until="domcontentloaded")
         await asyncio.sleep(2)
@@ -751,7 +869,26 @@ async def _fazer_login_e_abrir_smart(p):
         except Exception:
             pass
         await asyncio.sleep(3)
+        return browser, context, page
+    except Exception:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+        raise
 
+
+async def _fazer_login_e_abrir_smart(p):
+    browser, context, page = await _login_menu_geral(p)
+    popup_page = None
+
+    async def handle_popup(popup):
+        nonlocal popup_page
+        popup_page = popup
+
+    context.on("page", handle_popup)
+
+    try:
         try:
             await page.click("img[src*='btn_smart']", timeout=5000)
         except Exception:
