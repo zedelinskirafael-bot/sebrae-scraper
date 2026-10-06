@@ -1,5 +1,5 @@
 [Unit]
-Description=Roda o vigia de O.S. Sebrae a cada 15 min (o script decide a janela seg-sab 7h-21h BRT)
+Description=Roda o vigia de O.S. Sebrae a cada 15 min (24h/7d)
 
 [Timer]
 OnCalendar=*-*-* *:00/15:00

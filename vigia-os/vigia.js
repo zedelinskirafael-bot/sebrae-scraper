@@ -17,8 +17,11 @@ const {
   CONTA = "rafael",
   INTERVALO_MIN_S = "30",
   INTERVALO_MAX_S = "120",
-  JANELA_INICIO = "7",
-  JANELA_FIM = "21",
+  // Janela de funcionamento em horas BRT (inclusive). Padrao 0-23 = 24h/7d,
+  // decisao do Rafael em 06/10/2026: O.S. pode cair a qualquer hora e o prazo
+  // de aceite (3h) corre mesmo de madrugada e no domingo.
+  JANELA_INICIO = "0",
+  JANELA_FIM = "23",
   FALHAS_PARA_AVISAR = "6",
 } = process.env;
 
@@ -34,8 +37,7 @@ function agoraBR() {
 }
 
 function dentroDaJanela() {
-  const { hora, dia } = agoraBR();
-  if (dia === "dom") return false;
+  const { hora } = agoraBR();
   return hora >= parseInt(JANELA_INICIO, 10) && hora <= parseInt(JANELA_FIM, 10);
 }
 
@@ -172,7 +174,7 @@ async function tratarFalha(db, erro) {
 
 async function main() {
   if (!dentroDaJanela()) {
-    log("fora da janela (seg–sáb, " + JANELA_INICIO + "h–" + JANELA_FIM + "h BRT); nada a fazer");
+    log("fora da janela (" + JANELA_INICIO + "h–" + JANELA_FIM + "h BRT); nada a fazer");
     return;
   }
   const db = new Client({ connectionString: PG_URL });
