@@ -1,0 +1,13 @@
+[Unit]
+Description=Vigia de O.S. Sebrae (conta Geovana) - avisa Geovana e depois Rafael
+After=network-online.target postgresql.service docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/sebrae-os-vigia
+EnvironmentFile=/opt/sebrae-os-vigia/geovana.env
+ExecStart=/usr/bin/node /opt/sebrae-os-vigia/vigia.js
+TimeoutStartSec=600
+StandardOutput=append:/var/log/sebrae-os-vigia.log
+StandardError=append:/var/log/sebrae-os-vigia.log

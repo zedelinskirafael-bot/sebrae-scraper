@@ -39,6 +39,12 @@ SEBRAE_API = "https://api.pr.sebrae.com.br/crm-api"
 BANCO_PERGUNTAS_API = "https://api.pr.sebrae.com.br/banco-perguntas-api"
 SEBRAE_USER = os.getenv("SEBRAE_USER")
 SEBRAE_PASS = os.getenv("SEBRAE_PASS")
+# Contas do portal de credenciados que o vigia de O.S. pode ler. A do Rafael
+# e a padrao (SMART, worker, motor); a da Geovana so serve ao vigia.
+CONTAS_SEBRAE = {
+    "rafael": (SEBRAE_USER, SEBRAE_PASS),
+    "geovana": (os.getenv("SEBRAE_USER_GEOVANA"), os.getenv("SEBRAE_PASS_GEOVANA")),
+}
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 APP_KEY = os.getenv("APP_KEY")
@@ -76,13 +82,15 @@ async def debug_login():
 
 
 @app.get("/os-credenciado")
-async def os_credenciado():
+async def os_credenciado(conta: str = "rafael"):
     """Lista as O.S. do usuario no Portal de Empresas Credenciadas
     (Contratacao > Consultar Os). Consumido pelo vigia de O.S. (vigia-os/),
-    que compara com o que ja viu e avisa no WhatsApp."""
+    que compara com o que ja viu e avisa no WhatsApp. ?conta=rafael|geovana."""
+    if conta not in CONTAS_SEBRAE:
+        raise HTTPException(status_code=400, detail=f"conta desconhecida: {conta}")
     try:
         async with async_playwright() as p:
-            browser, context, page = await _login_menu_geral(p)
+            browser, context, page = await _login_menu_geral(p, conta)
             try:
                 portal = await _abrir_portal_credenciado(context, page)
                 linhas = await _ler_consultar_os(portal)
@@ -847,9 +855,12 @@ async def get_token() -> str:
                 pass
 
 
-async def _login_menu_geral(p):
+async def _login_menu_geral(p, conta: str = "rafael"):
     """Abre o navegador, faz login no SebraePR e entra na unidade.
     Devolve (browser, context, page) parado no MENU GERAL."""
+    usuario, senha = CONTAS_SEBRAE.get(conta, (None, None))
+    if not usuario or not senha:
+        raise Exception(f"conta '{conta}' sem credencial configurada")
     browser = await p.chromium.launch(
         headless=True,
         args=["--no-sandbox", "--disable-dev-shm-usage"]
@@ -859,8 +870,8 @@ async def _login_menu_geral(p):
     try:
         await page.goto(f"{SEBRAE_URL}/SebraePR/login.do", wait_until="domcontentloaded")
         await asyncio.sleep(2)
-        await page.fill("input[name='usuario']", SEBRAE_USER)
-        await page.fill("input[name='senha']", SEBRAE_PASS)
+        await page.fill("input[name='usuario']", usuario)
+        await page.fill("input[name='senha']", senha)
         await page.click("input[type='image'][alt='Ok']")
         await asyncio.sleep(3)
 

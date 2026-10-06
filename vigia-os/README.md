@@ -9,8 +9,17 @@ Avisa o **Rafael e a Geovana** (WhatsApp pessoal de cada um), com pausa aleatór
 30 s a 2 min entre os dois envios para não estressar a instância. Alerta técnico
 (portal fora, senha) vai só para o Rafael.
 
-Só a conta do Rafael (05/10/2026). A da Geovana entra quando ele decidir guardar a
-senha dela na VPS, igual à dele já está (`/opt/ia-hub/.env`, usada pelo scraper).
+**Duas contas, dois vigias** (desde 05/10/2026), o mesmo `vigia.js` com `.env` diferentes:
+
+| Conta lida | Timer | Ordem do aviso | Env |
+|-----------|-------|----------------|-----|
+| Rafael | `sebrae-os-vigia.timer`, 15 min (:00 :15 :30 :45) | Rafael → Geovana (30 s a 2 min) | `/opt/sebrae-os-vigia/.env` |
+| Geovana | `sebrae-os-vigia-geovana.timer`, 20 min (:05 :25 :45) | Geovana → Rafael (~2 min) | `/opt/sebrae-os-vigia/geovana.env` |
+
+As duas senhas do Sebrae ficam em `/opt/ia-hub/.env` (`SEBRAE_USER`/`SEBRAE_PASS` e
+`SEBRAE_USER_GEOVANA`/`SEBRAE_PASS_GEOVANA`), entregues ao contêiner pelo compose. O
+scraper escolhe pela query `?conta=rafael|geovana`. Quando os dois timers caem no
+mesmo minuto, o `SMART_LOCK` do scraper enfileira um atrás do outro.
 
 ## Peças (KVM8)
 
@@ -45,7 +54,8 @@ tail -20 /var/log/sebrae-os-vigia.log
 curl -s 127.0.0.1:8001/os-credenciado | jq      # testar só a leitura (~40s)
 ```
 
-Desligar: `systemctl disable --now sebrae-os-vigia.timer`.
+Desligar: `systemctl disable --now sebrae-os-vigia.timer sebrae-os-vigia-geovana.timer`.
+Os comandos acima valem para a conta Geovana trocando o nome da unit para `sebrae-os-vigia-geovana`.
 Zerar baseline (vai avisar tudo de novo na próxima rodada, cuidado):
 `delete from sebrae_os_vistas where conta='rafael';`
 

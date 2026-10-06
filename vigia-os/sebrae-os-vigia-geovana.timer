@@ -1,0 +1,10 @@
+[Unit]
+Description=Roda o vigia de O.S. Sebrae da conta Geovana a cada 20 min (:05, :25, :45; janela seg-sab 7h-21h BRT no script)
+
+[Timer]
+OnCalendar=*-*-* *:05/20:00
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

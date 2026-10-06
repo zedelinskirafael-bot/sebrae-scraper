@@ -99,7 +99,7 @@ async function buscarOS() {
   // ficar na fila atras do worker da Maquina de Vendas. Esperar nao e falha.
   const timer = setTimeout(() => ctrl.abort(), 540000);
   try {
-    const r = await fetch(`${SCRAPER_URL}/os-credenciado`, { signal: ctrl.signal });
+    const r = await fetch(`${SCRAPER_URL}/os-credenciado?conta=${encodeURIComponent(CONTA)}`, { signal: ctrl.signal });
     const corpo = await r.json().catch(() => ({}));
     if (!r.ok || !corpo.sucesso) {
       throw new Error(corpo.detail || `HTTP ${r.status}`);
