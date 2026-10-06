@@ -19,7 +19,7 @@ const {
   INTERVALO_MAX_S = "120",
   JANELA_INICIO = "7",
   JANELA_FIM = "21",
-  FALHAS_PARA_AVISAR = "3",
+  FALHAS_PARA_AVISAR = "6",
 } = process.env;
 
 const PORTAL = "https://app2.pr.sebrae.com.br/SebraePR/login.do";
@@ -163,7 +163,7 @@ async function tratarFalha(db, erro) {
       ? "login recusado (senha mudou?)"
       : String(erro).slice(0, 160);
     const ok = await enviarWhatsApp(
-      `⚠️ *Vigia de O.S. Sebrae*\nNão consigo acessar o portal há ${falhas} rodadas (~${(falhas * 30) / 60}h).\nMotivo: ${motivo}`,
+      `⚠️ *Vigia de O.S. Sebrae*\nNão consigo acessar o portal há ${falhas} rodadas (~${(falhas * 15) / 60}h).\nMotivo: ${motivo}`,
       { apenasPrimeiro: true } // problema técnico é só do Rafael
     );
     if (ok) await estadoGravar(db, "falha_avisada_em", hoje);

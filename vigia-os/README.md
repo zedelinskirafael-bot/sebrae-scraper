@@ -26,8 +26,8 @@ Log: `/var/log/sebrae-os-vigia.log`.
 ## Regras
 
 - **Primeira rodada = baseline**: grava tudo e não avisa.
-- **Falha** (portal fora, login recusado): tenta na próxima rodada; avisa só na 3ª
-  falha seguida, uma vez por dia.
+- **Falha** (portal fora, login recusado): tenta na próxima rodada; avisa só na 6ª
+  falha seguida (1h30 sem acesso), uma vez por dia.
 - **Sessão única do Sebrae**: o scraper serializa toda rota que abre navegador
   (`SMART_LOCK`). O vigia espera o worker da Máquina de Vendas terminar, nunca
   derruba a sessão dele.
