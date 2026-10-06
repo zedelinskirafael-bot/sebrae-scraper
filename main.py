@@ -22,7 +22,7 @@ app.add_middleware(
 SMART_LOCK = asyncio.Lock()
 ROTAS_COM_NAVEGADOR = {
     "/buscar-cliente", "/buscar-pesquisas", "/analise-risco",
-    "/graduar-cliente-maquina", "/os-credenciado", "/debug-login",
+    "/graduar-cliente-maquina", "/os-credenciado", "/nf-credenciado", "/debug-login",
 }
 
 
@@ -106,6 +106,144 @@ async def os_credenciado(conta: str = "rafael"):
         return {"sucesso": True, "os": linhas}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"portal credenciado: {e}")
+
+
+@app.get("/nf-credenciado")
+async def nf_credenciado(conta: str = "rafael", ano_anterior: bool = False):
+    """Lista as notas fiscais do credenciado no Portal de Empresas Credenciadas
+    (Financeiro > Consultar Nota Fiscal). Consumido pelo vigia de notas
+    (vigia-os/vigia-nf.js), que compara com o que ja viu e avisa no WhatsApp.
+    ?conta=rafael|geovana. &ano_anterior=true le tambem o ano anterior na
+    mesma sessao (virada de ano: nota de dezembro paga em janeiro)."""
+    if conta not in CONTAS_SEBRAE:
+        raise HTTPException(status_code=400, detail=f"conta desconhecida: {conta}")
+    try:
+        async with async_playwright() as p:
+            browser, context, page = await _login_menu_geral(p, conta)
+            try:
+                portal = await _abrir_portal_credenciado(context, page)
+                await _abrir_consultar_nf(portal)
+                notas, paginas = await _ler_consultar_nf(portal)
+                if ano_anterior:
+                    ano = _ano_brt() - 1
+                    mais, pag2 = await _ler_consultar_nf(portal, ano=ano)
+                    vistos = {n["codigo"] for n in notas if n.get("codigo")}
+                    notas += [n for n in mais if not n.get("codigo") or n["codigo"] not in vistos]
+                    paginas += pag2
+                try:
+                    await portal.goto(f"{SEBRAE_URL}/credenciado/Logout.do", timeout=15000)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+        return {"sucesso": True, "notas": notas, "paginas": paginas}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"portal credenciado: {e}")
+
+
+def _ano_brt():
+    from datetime import datetime, timedelta, timezone
+    return datetime.now(timezone(timedelta(hours=-3))).year
+
+
+_JS_TABELA_NF = """
+() => {
+  const limpar = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const corpo = limpar(document.body.innerText);
+  const mPag = corpo.match(/Exibir p[aá]gina de\\s*(\\d+)/i);
+  const totalPaginas = mPag ? parseInt(mPag[1], 10) : 1;
+  const tabelas = [...document.querySelectorAll('table')];
+  const t = tabelas.filter(tb => /Num\\. NF/i.test(tb.textContent) && tb.querySelector('tbody tr')).pop();
+  if (!t) return { linhas: [], totalPaginas, achouTabela: false };
+  const linhaCab = [...t.rows].find(r => /Num\\. NF/i.test(r.textContent) && r.cells.length >= 10);
+  if (!linhaCab) return { linhas: [], totalPaginas, achouTabela: false };
+  const cab = [...linhaCab.cells].map(c => limpar(c.innerText).toLowerCase());
+  const idx = (re) => cab.findIndex(h => re.test(h));
+  const iStatus = idx(/^status/), iNF = idx(/^num\\. nf/), iEmp = idx(/^empresa/), iOS = idx(/^num\\. os/),
+        iVal = idx(/^valor/), iOpt = idx(/^optante/), iRec = idx(/^data de receb/),
+        iApr = idx(/^data de aprop/), iPag = idx(/^data de pag/), iUlt = idx(/intera/);
+  const linhas = [];
+  for (const r of t.rows) {
+    if (r === linhaCab || r.cells.length < 10) continue;
+    const c = [...r.cells];
+    const txt = (i) => (i >= 0 && c[i]) ? limpar(c[i].innerText) : '';
+    const nf = txt(iNF);
+    if (!/^\\d+$/.test(nf)) continue;
+    const lbl = c[iStatus] && c[iStatus].querySelector('label');
+    const mCod = ((lbl && lbl.getAttribute('title')) || '').match(/(\\d{3,})/);
+    const lblEmp = c[iEmp] && c[iEmp].querySelector('label');
+    const credenciado = limpar(((lblEmp && lblEmp.getAttribute('title')) || '').replace(/Credenciado:/i, ''));
+    linhas.push({
+      codigo: mCod ? mCod[1] : null, status: txt(iStatus), nf, empresa: txt(iEmp), credenciado,
+      os: txt(iOS), valor: txt(iVal), optante_simples: !!(c[iOpt] && c[iOpt].querySelector('img')),
+      data_recebimento: txt(iRec), data_apropriacao: txt(iApr), data_pagamento: txt(iPag),
+      ultima_interacao: txt(iUlt),
+    });
+  }
+  return { linhas, totalPaginas, achouTabela: true };
+}
+"""
+
+
+async def _abrir_consultar_nf(portal):
+    """Financeiro (hover) > Consultar Nota Fiscal. Abre o formulario de filtros
+    (POST GoConsultarNotaFiscal.do); a lista so chega depois de Pesquisar."""
+    await portal.hover("text=Financeiro", timeout=10000)
+    await asyncio.sleep(1)
+    async with portal.expect_response(lambda r: "GoConsultarNotaFiscal.do" in r.url, timeout=30000):
+        await portal.click("text=Consultar Nota Fiscal", timeout=10000)
+    await portal.wait_for_selector("input[name='ano']", timeout=30000)
+    await asyncio.sleep(1)
+
+
+async def _pesquisar_nf(portal, ano=None):
+    if ano:
+        await portal.fill("input[name='ano']", str(ano))
+    async with portal.expect_response(lambda r: "GoConsultarNotaFiscalPager" in r.url, timeout=30000):
+        await portal.click("text=Pesquisar", timeout=10000)
+    await asyncio.sleep(2)
+
+
+async def _ler_consultar_nf(portal, ano=None):
+    """Pesquisa (ano corrente por padrao, filtro Status=Todas) e le a tabela.
+    Tenta 99 registros por pagina para nao paginar; se o portal ignorar, anda
+    pelas paginas com 'Proximo'. Devolve (notas, paginas_lidas)."""
+    await _pesquisar_nf(portal, ano)
+    try:
+        async with portal.expect_response(lambda r: "GoConsultarNotaFiscalPager" in r.url, timeout=10000):
+            await portal.fill("#pagerContainer_qtdePorPag", "99")
+            await portal.press("#pagerContainer_qtdePorPag", "Enter")
+        await asyncio.sleep(2)
+    except Exception:
+        pass  # fica com a paginacao padrao (10 por pagina); abaixo anda pelas paginas
+    lido = await portal.evaluate(_JS_TABELA_NF)
+    notas = list(lido["linhas"])
+    paginas = 1
+    total = int(lido.get("totalPaginas") or 1)
+    for _ in range(min(total - 1, 30)):
+        try:
+            async with portal.expect_response(lambda r: "GoConsultarNotaFiscalPager" in r.url, timeout=20000):
+                await portal.click("text=\"Próximo\"", timeout=5000)
+            await asyncio.sleep(2)
+        except Exception as e:
+            raise Exception(f"nao consegui passar para a pagina {paginas + 1} de {total}: {e}")
+        pag = await portal.evaluate(_JS_TABELA_NF)
+        novos = [n for n in pag["linhas"] if n.get("codigo") not in {x.get("codigo") for x in notas}]
+        if not novos:
+            break
+        notas += novos
+        paginas += 1
+    if not notas:
+        if not lido.get("achouTabela") and total > 1:
+            # Portal diz que ha paginas e o leitor nao achou a tabela: layout mudou.
+            raise Exception(f"portal mostra {total} paginas de notas mas nenhuma foi lida (layout mudou?)")
+        texto = await portal.evaluate("() => document.body.innerText")
+        if not re.search(r"Nenhum|nenhum registro|Exibir p[aá]gina", texto) and not lido.get("achouTabela"):
+            raise Exception("tela Consultar Nota Fiscal nao carregou a lista")
+    return notas, paginas
 
 
 async def _abrir_portal_credenciado(context, page):

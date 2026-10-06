@@ -1,0 +1,10 @@
+[Unit]
+Description=Roda o vigia de notas fiscais Sebrae (conta Geovana) de hora em hora, no minuto 40 (janela 7h-20h BRT no script)
+
+[Timer]
+OnCalendar=*-*-* *:40:00
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

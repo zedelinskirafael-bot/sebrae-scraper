@@ -1,0 +1,10 @@
+[Unit]
+Description=Roda o vigia de notas fiscais Sebrae (conta Rafael) de hora em hora, no minuto 10 (janela 7h-20h BRT no script)
+
+[Timer]
+OnCalendar=*-*-* *:10:00
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

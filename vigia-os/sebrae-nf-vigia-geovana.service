@@ -1,0 +1,13 @@
+[Unit]
+Description=Vigia de notas fiscais Sebrae (conta Geovana) - avisa Geovana e depois Rafael
+After=network-online.target postgresql.service docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/sebrae-os-vigia
+EnvironmentFile=/opt/sebrae-os-vigia/geovana.env
+ExecStart=/usr/bin/node /opt/sebrae-os-vigia/vigia-nf.js
+TimeoutStartSec=900
+StandardOutput=append:/var/log/sebrae-nf-vigia.log
+StandardError=append:/var/log/sebrae-nf-vigia.log
