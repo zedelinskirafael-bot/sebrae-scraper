@@ -2,7 +2,12 @@
 
 O portal do Sebrae não avisa quando cai uma O.S. nova para aceite. Este vigia olha
 **Contratação › Consultar Os** a cada 30 min e manda WhatsApp quando aparece O.S.
-nova ou quando o "Fluxo atual" de uma O.S. muda (ex.: Pendente → Aprovada).
+nova ou quando o "Fluxo atual" de uma O.S. muda (ex.: Pendente → Aprovada). O prazo de
+aceite é de **3 horas**; depois a O.S. vai para outra empresa, por isso a urgência.
+
+Avisa o **Rafael e a Geovana** (WhatsApp pessoal de cada um), com pausa aleatória de
+30 s a 2 min entre os dois envios para não estressar a instância. Alerta técnico
+(portal fora, senha) vai só para o Rafael.
 
 Só a conta do Rafael (05/10/2026). A da Geovana entra quando ele decidir guardar a
 senha dela na VPS, igual à dele já está (`/opt/ia-hub/.env`, usada pelo scraper).

@@ -13,8 +13,10 @@ const {
   EVO_URL,
   EVO_KEY,
   EVO_INSTANCE = "claudinho",
-  DESTINO,
+  DESTINOS,
   CONTA = "rafael",
+  INTERVALO_MIN_S = "30",
+  INTERVALO_MAX_S = "120",
   JANELA_INICIO = "7",
   JANELA_FIM = "21",
   FALHAS_PARA_AVISAR = "3",
@@ -41,22 +43,54 @@ function log(...a) {
   console.log(new Date().toISOString(), "[vigia-os]", ...a);
 }
 
-async function enviarWhatsApp(texto) {
-  if (!EVO_URL || !EVO_KEY || !DESTINO) {
-    log("sem credencial Evolution/DESTINO; mensagem nao enviada:", texto);
-    return false;
-  }
+// Quem recebe: lista separada por virgula (Rafael primeiro, depois Geovana).
+const LISTA_DESTINOS = (DESTINOS || "").split(",").map((s) => s.trim()).filter(Boolean);
+
+const dormir = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function pausaAleatoriaMs() {
+  const min = parseInt(INTERVALO_MIN_S, 10) * 1000;
+  const max = parseInt(INTERVALO_MAX_S, 10) * 1000;
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+async function enviarPara(numero, texto) {
   const r = await fetch(`${EVO_URL}/message/sendText/${EVO_INSTANCE}`, {
     method: "POST",
     headers: { apikey: EVO_KEY, "Content-Type": "application/json; charset=utf-8" },
-    body: JSON.stringify({ number: DESTINO, text: texto }),
+    body: JSON.stringify({ number: numero, text: texto }),
   });
   if (!r.ok) {
     const corpo = await r.text().catch(() => "");
-    log(`envio falhou HTTP ${r.status}: ${corpo.slice(0, 200)}`);
+    log(`envio para ${numero} falhou HTTP ${r.status}: ${corpo.slice(0, 200)}`);
     return false;
   }
   return true;
+}
+
+// Manda para todos os destinos, com pausa aleatoria entre um e outro para a
+// instancia nao disparar duas mensagens iguais no mesmo segundo. Devolve true
+// se pelo menos um recebeu (ai nao retenta, para nao duplicar no que recebeu).
+async function enviarWhatsApp(texto, { apenasPrimeiro = false } = {}) {
+  if (!EVO_URL || !EVO_KEY || LISTA_DESTINOS.length === 0) {
+    log("sem credencial Evolution/DESTINOS; mensagem nao enviada:", texto);
+    return false;
+  }
+  const alvos = apenasPrimeiro ? LISTA_DESTINOS.slice(0, 1) : LISTA_DESTINOS;
+  let algumOk = false;
+  for (let i = 0; i < alvos.length; i++) {
+    if (i > 0) {
+      const ms = pausaAleatoriaMs();
+      log(`aguardando ${Math.round(ms / 1000)}s antes do próximo destino`);
+      await dormir(ms);
+    }
+    try {
+      if (await enviarPara(alvos[i], texto)) algumOk = true;
+    } catch (e) {
+      log(`erro ao enviar para ${alvos[i]}:`, e.message || e);
+    }
+  }
+  return algumOk;
 }
 
 async function buscarOS() {
@@ -129,7 +163,8 @@ async function tratarFalha(db, erro) {
       ? "login recusado (senha mudou?)"
       : String(erro).slice(0, 160);
     const ok = await enviarWhatsApp(
-      `⚠️ *Vigia de O.S. Sebrae*\nNão consigo acessar o portal há ${falhas} rodadas (~${(falhas * 30) / 60}h).\nMotivo: ${motivo}`
+      `⚠️ *Vigia de O.S. Sebrae*\nNão consigo acessar o portal há ${falhas} rodadas (~${(falhas * 30) / 60}h).\nMotivo: ${motivo}`,
+      { apenasPrimeiro: true } // problema técnico é só do Rafael
     );
     if (ok) await estadoGravar(db, "falha_avisada_em", hoje);
   }
