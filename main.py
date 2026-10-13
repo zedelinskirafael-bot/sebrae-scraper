@@ -2884,13 +2884,25 @@ async def crf_incluir(req: CrfIncluirRequest):
                     await asyncio.sleep(3)
                     depois = await portal.evaluate(_JS_TABELA_CERTIDOES)
                     diag["certidoes_depois"] = depois
-                    linha = [c for c in depois
-                             if c.get("certidao", "").strip().upper() == tipo
-                             and c.get("validade", "").strip() == req.data_validade.strip()]
-                    diag["gravou"] = bool(linha)
-                    diag["linha_nova"] = linha[0] if linha else None
-                    if not linha:
-                        raise Exception("salvei mas a certidao nao aparece na lista com a validade pedida")
+                    de_antes = next((c for c in antes
+                                     if c.get("certidao", "").strip().upper() == tipo), None)
+                    linha = next((c for c in depois
+                                  if c.get("certidao", "").strip().upper() == tipo
+                                  and c.get("validade", "").strip() == req.data_validade.strip()), None)
+                    # Nao basta existir linha com a validade pedida: se a validade
+                    # pedida for igual a que ja estava, a linha ANTIGA passa por nova
+                    # (foi o falso positivo de 13/10/2026). A prova e o "Enviada em"
+                    # ter mudado.
+                    mudou = bool(linha) and (
+                        de_antes is None or linha.get("enviada_em") != de_antes.get("enviada_em"))
+                    diag["gravou"] = mudou
+                    diag["linha_nova"] = linha
+                    diag["linha_antes"] = de_antes
+                    if not mudou:
+                        pop = ((diag.get("popup") or {}).get("texto") or "").strip()
+                        raise Exception(
+                            ("o portal nao gravou -- " + pop[:240]) if pop else
+                            "cliquei em Salvar e a lista nao mudou (mesmo 'Enviada em')")
                 else:
                     # sai pelo Voltar para nao deixar formulario pendurado
                     try:
