@@ -25,11 +25,11 @@ SMART_LOCK = asyncio.Lock()
 ROTAS_COM_NAVEGADOR = {
     "/buscar-cliente", "/buscar-pesquisas", "/analise-risco",
     "/graduar-cliente-maquina", "/os-credenciado", "/nf-credenciado", "/debug-login",
-    "/nf-os-dossie", "/nf-incluir",
+    "/nf-os-dossie", "/nf-incluir", "/crf-mapear", "/crf-incluir",
 }
 # Rotas privadas: token conferido no middleware, ANTES do lock, para que
 # anonimo nao consiga segurar a fila da sessao unica do Sebrae.
-ROTAS_PROTEGIDAS = {"/nf-os-dossie", "/nf-incluir", "/debug-login"}
+ROTAS_PROTEGIDAS = {"/nf-os-dossie", "/nf-incluir", "/debug-login", "/crf-mapear", "/crf-incluir"}
 
 
 @app.middleware("http")
@@ -2420,3 +2420,500 @@ async def _contar_visitas_pap(page, codigo: str) -> int:
 def _extrair_token_da_url(url: str):
     match = re.search(r'[?&]token=([a-f0-9\-]{36})', url, re.IGNORECASE)
     return match.group(1) if match else None
+
+
+# =====================================================================
+# Financeiro > Certidao Negativa  (certidoes do credenciado)
+# Cadastrar no portal a CRF/FGTS que o Claudinho emite todo dia.
+# O portal e legado (Struts, .do) e o menu de topo e montado por JS no
+# hover -- nao da pra achar o item pelos links da home. Por isso o
+# caminho e: /crf-mapear (SO LEITURA) descobre o item, a tela e os
+# campos; depois /crf-incluir grava. Nada aqui aprova nem cancela nada.
+# =====================================================================
+
+_JS_LINKS_DO = r"""
+() => {
+  const limpar = s => (s || '').replace(/\s+/g, ' ').trim();
+  const saida = [];
+  for (const a of document.querySelectorAll('a')) {
+    const h = a.getAttribute('href') || '';
+    const oc = a.getAttribute('onclick') || '';
+    const t = limpar(a.innerText);
+    if (!/\.do/i.test(h + ' ' + oc)) continue;
+    saida.push({ texto: t.slice(0, 60), href: limpar(h).slice(0, 160), onclick: limpar(oc).slice(0, 160) });
+  }
+  return saida;
+}
+"""
+
+# Acha um item onde ele estiver no DOM (menu escondido, aba, botao), por
+# texto, href, onclick ou id. E assim que se descobre a rota .do de uma
+# tela nova sem adivinhar nome de arquivo.
+_JS_BUSCAR = r"""
+(termo) => {
+  const limpar = s => (s || '').replace(/\s+/g, ' ').trim();
+  const re = new RegExp(termo, 'i');
+  const saida = [];
+  for (const e of document.querySelectorAll('a,td,th,div,span,li,button,input,img,label')) {
+    const txt = limpar(e.innerText || e.value || e.alt || e.title);
+    if (txt.length > 140) continue;              // pula containers grandes
+    const h = e.getAttribute('href') || '';
+    const oc = e.getAttribute('onclick') || '';
+    if (!re.test(txt + ' ' + h + ' ' + oc + ' ' + (e.id || ''))) continue;
+    saida.push({
+      tag: e.tagName.toLowerCase(), id: e.id || '',
+      classe: (e.className || '').toString().slice(0, 40),
+      texto: txt.slice(0, 90), href: limpar(h).slice(0, 180),
+      onclick: limpar(oc).slice(0, 220),
+      visivel: !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length),
+    });
+  }
+  return saida.slice(0, 50);
+}
+"""
+
+_JS_ESTRUTURA = r"""
+() => {
+  const limpar = s => (s || '').replace(/\s+/g, ' ').trim();
+  const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+  const rotulo = (e) => {
+    try {
+      const td = e.closest('td');
+      if (td && td.previousElementSibling) return limpar(td.previousElementSibling.innerText).slice(0, 60);
+      if (e.labels && e.labels.length) return limpar(e.labels[0].innerText).slice(0, 60);
+    } catch (x) {}
+    return '';
+  };
+  const campos = [...document.querySelectorAll('input,select,textarea')].map(e => {
+    const o = {
+      tag: e.tagName.toLowerCase(), type: (e.type || '').toLowerCase(),
+      id: e.id || '', name: e.name || '', rotulo: rotulo(e),
+      valor: ((e.type || '').toLowerCase() === 'password' ? '***' : limpar(e.value)).slice(0, 60),
+      visivel: vis(e),
+    };
+    if (e.tagName === 'SELECT') o.opcoes = [...e.options].map(x => limpar(x.text) + ' => ' + x.value).slice(0, 40);
+    return o;
+  });
+  const botoes = [...document.querySelectorAll('a,button,input[type=button],input[type=submit],input[type=image]')]
+    .map(e => ({
+      tag: e.tagName.toLowerCase(), id: e.id || '', name: e.name || '',
+      texto: limpar(e.innerText || e.value || e.alt || e.title).slice(0, 50),
+      href: limpar(e.getAttribute('href')).slice(0, 160),
+      onclick: limpar(e.getAttribute('onclick')).slice(0, 200),
+      visivel: vis(e),
+    }))
+    .filter(b => b.texto || b.onclick || b.href);
+  return { url: location.href, titulo: document.title, campos, botoes };
+}
+"""
+
+# Candidatos a "Incluir" com o texto da tabela em volta: e assim que da pra
+# saber qual Incluir e o do bloco do FGTS sem adivinhar indice de coluna.
+_JS_ALVOS_INCLUIR = r"""
+() => {
+  const limpar = s => (s || '').replace(/\s+/g, ' ').trim();
+  const todos = [...document.querySelectorAll('a,button,input[type=button],input[type=submit],input[type=image]')];
+  const casa = e => /incluir|adicionar|novo/i.test(
+    (e.innerText || '') + ' ' + (e.value || '') + ' ' + (e.alt || '') + ' ' +
+    (e.title || '') + ' ' + (e.id || '') + ' ' + (e.getAttribute('onclick') || '') + ' ' +
+    (e.getAttribute('href') || '')
+  );
+  return todos.filter(casa).map((e, i) => ({
+    i, tag: e.tagName.toLowerCase(), id: e.id || '', name: e.name || '',
+    texto: limpar(e.innerText || e.value || e.alt || e.title).slice(0, 50),
+    onclick: limpar(e.getAttribute('onclick')).slice(0, 200),
+    href: limpar(e.getAttribute('href')).slice(0, 160),
+    contexto: limpar((e.closest('table') || e.parentElement || document.body).innerText).slice(0, 300),
+  }));
+}
+"""
+
+_JS_CLICAR_ALVO = r"""
+(i) => {
+  const limpar = s => (s || '').replace(/\s+/g, ' ').trim();
+  const todos = [...document.querySelectorAll('a,button,input[type=button],input[type=submit],input[type=image]')];
+  const casa = e => /incluir|adicionar|novo/i.test(
+    (e.innerText || '') + ' ' + (e.value || '') + ' ' + (e.alt || '') + ' ' +
+    (e.title || '') + ' ' + (e.id || '') + ' ' + (e.getAttribute('onclick') || '') + ' ' +
+    (e.getAttribute('href') || '')
+  );
+  const lista = todos.filter(casa);
+  if (i < 0 || i >= lista.length) return { erro: 'indice fora da lista', total: lista.length };
+  const e = lista[i];
+  const ficha = {
+    texto: limpar(e.innerText || e.value || e.alt || e.title).slice(0, 50),
+    id: e.id || '', onclick: limpar(e.getAttribute('onclick')).slice(0, 200),
+  };
+  e.click();
+  return { clicado: ficha, total: lista.length };
+}
+"""
+
+
+@app.get("/crf-mapear")
+async def crf_mapear(
+    conta: str = "rafael",
+    menu: Optional[str] = Query(None, description="texto do menu de topo para passar o mouse antes, ex: Financeiro"),
+    buscar: Optional[str] = Query(None, description="regex para achar o item no DOM, ex: ertid|negativ"),
+    abrir: Optional[str] = Query(None, description="texto do item de menu para clicar, ex: Negativa"),
+    ir: Optional[str] = Query(None, description="rota .do do portal, ex: GoConsultarCertidaoNegativa.do"),
+    clicar: Optional[int] = Query(None, description="indice em alvos_incluir para clicar (abre o formulario)"),
+):
+    """SO LEITURA — mapeia Financeiro > Certidao Negativa para descobrir os
+    seletores do cadastro da CRF/FGTS.
+    - sem parametro: links .do da home
+    - &menu=Financeiro: passa o mouse no menu antes de olhar o DOM
+    - &buscar=ertid|negativ: acha o item (devolve href/onclick de cada um)
+    - &abrir=Negativa: clica no item do menu (o link e javascript:void(0),
+      so o clique real navega) e devolve a tela que abriu
+    - &ir=<Rota.do>: navega e devolve texto + campos + botoes + candidatos a Incluir
+    - &clicar=N: clica no N-esimo candidato e devolve o formulario que abriu
+    Nada e preenchido nem salvo."""
+    if conta not in CONTAS_SEBRAE:
+        raise HTTPException(status_code=400, detail=f"conta desconhecida: {conta}")
+    saida = {"conta": conta}
+    try:
+        async with async_playwright() as p:
+            browser, context, page = await _login_menu_geral(p, conta)
+            try:
+                portal = await _abrir_portal_credenciado(context, page)
+                _travar_dialogos(portal)
+                if menu:
+                    try:
+                        await portal.hover(f"text={menu}", timeout=10000)
+                        await asyncio.sleep(1)
+                        saida["hover"] = menu
+                    except Exception as e:
+                        saida["hover_erro"] = str(e)[:120]
+                if buscar:
+                    saida["achados"] = await portal.evaluate(_JS_BUSCAR, buscar)
+                elif not abrir:
+                    saida["links_home"] = await portal.evaluate(_JS_LINKS_DO)
+                navegou = False
+                if abrir:
+                    # O item do menu e <a href="javascript:void(0)">: so o clique
+                    # real dispara o POST que monta a tela.
+                    try:
+                        async with portal.expect_response(lambda r: ".do" in r.url, timeout=30000):
+                            await portal.click(f'a:has-text("{abrir}")', timeout=10000)
+                    except Exception as e:
+                        saida["abrir_erro"] = str(e)[:160]
+                        try:
+                            await portal.click(f'a:has-text("{abrir}")', timeout=5000)
+                        except Exception:
+                            pass
+                    await asyncio.sleep(3)
+                    try:
+                        await portal.wait_for_load_state("networkidle", timeout=15000)
+                    except Exception:
+                        pass
+                    navegou = True
+                if ir:
+                    await portal.goto(f"{SEBRAE_URL}/credenciado/{ir}", timeout=30000)
+                    await asyncio.sleep(2)
+                    navegou = True
+                if navegou:
+                    saida["url"] = _mascarar(portal.url)
+                    saida["texto"] = (await portal.inner_text("body"))[:4000]
+                    saida["estrutura"] = await portal.evaluate(_JS_ESTRUTURA)
+                    saida["alvos_incluir"] = await portal.evaluate(_JS_ALVOS_INCLUIR)
+                    if clicar is not None:
+                        antes = len(context.pages)
+                        saida["clique"] = await portal.evaluate(_JS_CLICAR_ALVO, clicar)
+                        await asyncio.sleep(3)
+                        alvo = context.pages[-1] if len(context.pages) > antes else portal
+                        try:
+                            await alvo.wait_for_load_state("networkidle", timeout=15000)
+                        except Exception:
+                            pass
+                        saida["aba_nova"] = len(context.pages) > antes
+                        saida["url_form"] = _mascarar(alvo.url)
+                        saida["texto_form"] = (await alvo.inner_text("body"))[:4000]
+                        saida["estrutura_form"] = await alvo.evaluate(_JS_ESTRUTURA)
+                try:
+                    await portal.goto(f"{SEBRAE_URL}/credenciado/Logout.do", timeout=15000)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+        return {"sucesso": True, **saida}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"crf-mapear: {e}")
+
+
+# ---------------------------------------------------------------------
+# Financeiro > Certidao Negativa > Incluir  (grava)
+# Campos descobertos no mapeamento de 13/10/2026:
+#   Tipo de Certidao  select#idcodigoDominio   FGTS=2, RECEITA FEDERAL=3,
+#                                              Decl. Optante Simples=6
+#   Data de Emissao   input#iddataEmissao      (nasce escondido; o JS do
+#                                              portal mostra ao escolher o tipo)
+#   Data de Validade  input#iddataValidade
+#   Link Utilizado    textarea#idlinkUtilizado (opcional)
+#   Tipo de Vinculo   radio#idSocio / #idFuncionario (name certidaoVO.vinculo)
+#   Observacoes       textarea#certidaoVO.descricaoObservacao (opcional)
+#   Arquivo           input#arquivo  -- somente PDF
+#   Salvar            a[onclick*=TELA_Cadastrar_Certidao.salvar]
+#   Voltar            a[onclick*=TELA_Cadastrar_Certidao.cancelar]
+# O "Incluir" de baixo e de CONTRATO SOCIAL (goFormularioContratoSocial) --
+# nunca usar. "Editar" de linha existente tambem e proibido aqui.
+# ---------------------------------------------------------------------
+
+_DOMINIO_CERTIDAO = {
+    "FGTS": "2",
+    "RECEITA FEDERAL": "3",
+    "DECLARACAO OPTANTE SIMPLES NACIONAL": "6",
+}
+
+_JS_TABELA_CERTIDOES = r"""
+() => {
+  const limpar = s => (s || '').replace(/\s+/g, ' ').trim();
+  const tabelas = [...document.querySelectorAll('table')];
+  const t = tabelas.find(x => /Expira em/i.test(x.textContent) && /Validade/i.test(x.textContent));
+  if (!t) return [];
+  const linhas = [];
+  for (const r of t.rows) {
+    const c = [...r.cells].map(x => limpar(x.innerText));
+    if (c.length < 6) continue;
+    if (/^Certid/i.test(c[0]) || !c[0]) continue;      // cabecalho ou linha vazia
+    linhas.push({
+      certidao: c[0], validade: c[1], expira_em: c[2], observacoes: c[3],
+      status: c[4], enviada_em: c[5], verif_sebrae: c[6] || '', validador: c[7] || '',
+    });
+  }
+  return linhas;
+}
+"""
+
+# O portal nasce com dataEmissao escondido; o fill do Playwright recusa campo
+# invisivel. Depois de escolher o tipo tentamos o fill normal e, se o campo
+# continuar escondido, setamos pelo DOM disparando os eventos que o JS espera.
+_JS_SETAR_DATA = r"""
+([id, valor]) => {
+  const e = document.getElementById(id);
+  if (!e) return { erro: 'campo ' + id + ' nao existe' };
+  e.value = valor;
+  e.dispatchEvent(new Event('input', { bubbles: true }));
+  e.dispatchEvent(new Event('change', { bubbles: true }));
+  e.dispatchEvent(new Event('blur', { bubbles: true }));
+  return { id, valor: e.value };
+}
+"""
+
+_JS_LER_FORM = r"""
+() => {
+  const v = id => { const e = document.getElementById(id); return e ? e.value : null; };
+  const m = id => { const e = document.getElementById(id); return e ? !!e.checked : null; };
+  const sel = document.getElementById('idcodigoDominio');
+  return {
+    tipo_valor: sel ? sel.value : null,
+    tipo_texto: sel && sel.selectedIndex >= 0 ? (sel.options[sel.selectedIndex].text || '').trim() : null,
+    data_emissao: v('iddataEmissao'), data_validade: v('iddataValidade'),
+    link_utilizado: v('idlinkUtilizado'),
+    socio: m('idSocio'), funcionario: m('idFuncionario'),
+    vinculo_hidden: v('hiddenVinculo'),
+    arquivo: (() => { const e = document.getElementById('arquivo'); return e && e.files && e.files.length ? e.files[0].name : null; })(),
+    aviso: (document.body.innerText.match(/campo[s]? obrigat[^\n]*|informe[^\n]*|inv[aá]lid[^\n]*/i) || [''])[0].slice(0, 160),
+  };
+}
+"""
+
+
+class CrfIncluirRequest(BaseModel):
+    tipo: str = "FGTS"                       # FGTS | RECEITA FEDERAL | DECLARACAO OPTANTE SIMPLES NACIONAL
+    data_emissao: str                        # dd/mm/aaaa
+    data_validade: str                       # dd/mm/aaaa
+    pdf_base64: str                          # o documento (somente PDF)
+    nome_arquivo: Optional[str] = None
+    vinculo: str = "socio"                   # socio | funcionario
+    link_utilizado: Optional[str] = None     # o Rafael deixa vazio
+    observacoes: Optional[str] = None        # idem
+    conta: str = "rafael"
+    ate: str = "preencher"                   # preencher (nao grava) | fim (salva)
+    permitir_duplicada: bool = False         # trava: mesma certidao + mesma validade ja cadastrada
+
+
+def _data_ok(d):
+    return bool(re.fullmatch(r"\d{2}/\d{2}/\d{4}", (d or "").strip()))
+
+
+@app.post("/crf-incluir")
+async def crf_incluir(req: CrfIncluirRequest):
+    """Financeiro > Certidao Negativa > Incluir: cadastra no portal do Sebrae a
+    certidao que o Claudinho emitiu. ate='preencher' (padrao) preenche tudo,
+    devolve o que ficou na tela e SAI SEM GRAVAR; ate='fim' clica em Salvar e
+    confere o status na lista. Trava de duplicata: recusa se ja houver a mesma
+    certidao com a mesma validade (foi o caso de 13/10/2026, quando a Caixa
+    ainda nao tinha liberado a nova)."""
+    if req.conta not in CONTAS_SEBRAE:
+        raise HTTPException(status_code=400, detail=f"conta desconhecida: {req.conta}")
+    tipo = (req.tipo or "").strip().upper()
+    dominio = _DOMINIO_CERTIDAO.get(tipo)
+    if not dominio:
+        raise HTTPException(status_code=400, detail=f"tipo invalido: {req.tipo} (use {list(_DOMINIO_CERTIDAO)})")
+    if not _data_ok(req.data_emissao) or not _data_ok(req.data_validade):
+        raise HTTPException(status_code=400, detail="datas devem estar em dd/mm/aaaa")
+    if (req.vinculo or "").strip().lower() not in ("socio", "funcionario"):
+        raise HTTPException(status_code=400, detail="vinculo deve ser socio ou funcionario")
+    if req.ate not in ("preencher", "fim"):
+        raise HTTPException(status_code=400, detail="ate deve ser 'preencher' ou 'fim'")
+    try:
+        bruto = base64.b64decode(req.pdf_base64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="pdf_base64 nao e base64 valido")
+    if not bruto.startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail="o arquivo nao e PDF (o portal aceita somente PDF)")
+
+    nome = req.nome_arquivo or f"CRF-{tipo.replace(' ', '-')}-{req.data_validade.replace('/', '-')}.pdf"
+    if not nome.lower().endswith(".pdf"):
+        nome += ".pdf"
+    caminho = f"/tmp/{re.sub(r'[^A-Za-z0-9._-]', '_', nome)}"
+    with open(caminho, "wb") as f:
+        f.write(bruto)
+
+    diag = {"tipo": tipo, "dominio": dominio, "arquivo": nome, "bytes": len(bruto), "ate": req.ate}
+    try:
+        async with async_playwright() as p:
+            browser, context, page = await _login_menu_geral(p, req.conta)
+            try:
+                portal = await _abrir_portal_credenciado(context, page)
+                _travar_dialogos(portal)
+
+                # 1. Financeiro > Certidao Negativa
+                await portal.hover("text=Financeiro", timeout=10000)
+                await asyncio.sleep(1)
+                try:
+                    async with portal.expect_response(lambda r: ".do" in r.url, timeout=30000):
+                        await portal.click('a:has-text("Negativa")', timeout=10000)
+                except Exception:
+                    await portal.click('a:has-text("Negativa")', timeout=5000)
+                await asyncio.sleep(3)
+                antes = await portal.evaluate(_JS_TABELA_CERTIDOES)
+                diag["certidoes_antes"] = antes
+
+                # 2. Trava de duplicata
+                igual = [c for c in antes
+                         if c.get("certidao", "").strip().upper() == tipo
+                         and c.get("validade", "").strip() == req.data_validade.strip()]
+                if igual and not req.permitir_duplicada:
+                    diag["duplicada"] = igual
+                    raise Exception(
+                        f"ja existe {tipo} com validade {req.data_validade} no portal "
+                        f"(status {igual[0].get('status')}, enviada em {igual[0].get('enviada_em')}). "
+                        "Emita a certidao nova ou chame com permitir_duplicada=true."
+                    )
+
+                # 3. Incluir -> formulario de certidao (NAO o de contrato social)
+                await portal.click('a[onclick*="goFormularioCertificado"]', timeout=10000)
+                await asyncio.sleep(3)
+                if not await portal.is_visible("#idcodigoDominio"):
+                    raise Exception("o formulario de certidao nao abriu (select de tipo ausente)")
+
+                # 4. Tipo de certidao (o JS do portal revela a data de emissao)
+                await portal.select_option("#idcodigoDominio", dominio, timeout=10000)
+                await asyncio.sleep(2)
+
+                # 5. Datas
+                for campo, valor in (("iddataEmissao", req.data_emissao), ("iddataValidade", req.data_validade)):
+                    posto = False
+                    try:
+                        if await portal.is_visible(f"#{campo}"):
+                            await portal.fill(f"#{campo}", valor, timeout=8000)
+                            posto = True
+                    except Exception:
+                        posto = False
+                    if not posto:
+                        diag.setdefault("datas_pelo_dom", []).append(
+                            await portal.evaluate(_JS_SETAR_DATA, [campo, valor]))
+                    await asyncio.sleep(0.5)
+
+                # 6. Tipo de vinculo
+                alvo = "#idSocio" if req.vinculo.strip().lower() == "socio" else "#idFuncionario"
+                await portal.check(alvo, timeout=8000)
+                await asyncio.sleep(0.5)
+
+                # 7. Opcionais
+                if req.link_utilizado:
+                    await portal.fill("#idlinkUtilizado", req.link_utilizado[:350], timeout=8000)
+                if req.observacoes:
+                    await portal.fill("#certidaoVO\\.descricaoObservacao", req.observacoes[:350], timeout=8000)
+
+                # 8. Anexo
+                await portal.set_input_files("#arquivo", caminho, timeout=15000)
+                await asyncio.sleep(1)
+
+                # 9. Conferencia dupla antes de qualquer gravacao
+                na_tela = await portal.evaluate(_JS_LER_FORM)
+                diag["formulario"] = na_tela
+                erros = []
+                if na_tela.get("tipo_valor") != dominio:
+                    erros.append(f"tipo na tela e {na_tela.get('tipo_texto')!r}, pedi {tipo}")
+                if (na_tela.get("data_emissao") or "").strip() != req.data_emissao:
+                    erros.append(f"emissao na tela e {na_tela.get('data_emissao')!r}, pedi {req.data_emissao}")
+                if (na_tela.get("data_validade") or "").strip() != req.data_validade:
+                    erros.append(f"validade na tela e {na_tela.get('data_validade')!r}, pedi {req.data_validade}")
+                if req.vinculo.strip().lower() == "socio" and not na_tela.get("socio"):
+                    erros.append("o radio Socio nao ficou marcado")
+                if not na_tela.get("arquivo"):
+                    erros.append("o PDF nao aparece no campo Arquivo")
+                diag["conferencia"] = erros or "ok"
+                if erros:
+                    raise Exception("formulario divergente, nao gravei: " + " | ".join(erros))
+
+                # 10. Gravar (so com ate=fim)
+                if req.ate == "fim":
+                    await portal.click('a[onclick*="TELA_Cadastrar_Certidao.salvar"]', timeout=10000)
+                    await asyncio.sleep(4)
+                    try:
+                        diag["popup"] = await _popup(portal)
+                    except Exception as e:
+                        diag["popup_erro"] = str(e)[:160]
+                    await asyncio.sleep(2)
+                    diag["texto_apos_salvar"] = (await portal.inner_text("body"))[:1200]
+                    # prova final: volta na lista e le o status
+                    await portal.hover("text=Financeiro", timeout=10000)
+                    await asyncio.sleep(1)
+                    try:
+                        async with portal.expect_response(lambda r: ".do" in r.url, timeout=30000):
+                            await portal.click('a:has-text("Negativa")', timeout=10000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(3)
+                    depois = await portal.evaluate(_JS_TABELA_CERTIDOES)
+                    diag["certidoes_depois"] = depois
+                    linha = [c for c in depois
+                             if c.get("certidao", "").strip().upper() == tipo
+                             and c.get("validade", "").strip() == req.data_validade.strip()]
+                    diag["gravou"] = bool(linha)
+                    diag["linha_nova"] = linha[0] if linha else None
+                    if not linha:
+                        raise Exception("salvei mas a certidao nao aparece na lista com a validade pedida")
+                else:
+                    # sai pelo Voltar para nao deixar formulario pendurado
+                    try:
+                        await portal.click('a[onclick*="TELA_Cadastrar_Certidao.cancelar"]', timeout=8000)
+                        await asyncio.sleep(2)
+                        diag["saida"] = "voltei sem gravar"
+                    except Exception as e:
+                        diag["saida"] = f"nao achei o Voltar: {str(e)[:100]}"
+
+                try:
+                    await portal.goto(f"{SEBRAE_URL}/credenciado/Logout.do", timeout=15000)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+        return {"sucesso": True, **diag}
+    except Exception as e:
+        return JSONResponse({"sucesso": False, "erro": str(e)[:400], **diag}, status_code=502)
+    finally:
+        try:
+            os.remove(caminho)
+        except Exception:
+            pass
