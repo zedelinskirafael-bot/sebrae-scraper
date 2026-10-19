@@ -5,6 +5,8 @@ from pydantic import BaseModel
 from playwright.async_api import async_playwright
 from supabase import create_client
 import os, asyncio, base64, hmac, httpx, re
+import datetime as _dt
+import time as _time
 from typing import Optional
 
 app = FastAPI()
@@ -1565,140 +1567,364 @@ async def nf_incluir(req: IncluirNFRequest):
         raise HTTPException(status_code=502, detail=f"portal credenciado: {_mascarar(str(e))}")
 
 
-@app.post("/buscar-cliente")
-async def buscar_cliente(req: ScrapeRequest):
+# =====================================================================
+# Cadastro completo do Smart (2a etapa do Apollo, Parte 1 -- 19/10/26)
+# Empresa + atividade + socios com vinculo, nascimento e contatos
+# (WhatsApp/principal). LGPD (decisao do Rafael): CPF, endereco
+# residencial, sexo, escolaridade e estado civil do socio NAO sao gravados.
+# Regras que seguram a producao:
+#   - so le do Sebrae (GET); nada aqui escreve no Smart;
+#   - empresa que nao volta certinha do Smart = erro, sem gravar nada
+#     (antes gravava vazio por cima e apagava endereco/coordenada bons);
+#   - campo vazio do Smart nunca apaga valor do Apollo;
+#   - mesmas regras de identidade da limpeza do motor (limparDuplicados):
+#     socio pelo codigo (ou pelo nome), telefone pelos digitos, e-mail
+#     minusculo -- e cada telefone/e-mail existe UMA vez por cliente
+#     (empresa + socios). Rodar de novo nao insere nada que o motor
+#     apagaria em seguida;
+#   - nada e apagado: contato que sumiu do Smart fica no Apollo.
+# =====================================================================
+
+# Token do Smart reaproveitado por alguns minutos: cada login leva ~30 s e a
+# conta tem sessao unica (Decisao 4). Os logins do Smart (get_token, analise
+# de risco, graduacao) guardam o token aqui; so /buscar-cliente le o cache
+# e, se o Smart recusar o token guardado, faz login de novo uma vez.
+_TOKEN_SMART = {"token": None, "em": 0.0}
+TOKEN_SMART_TTL = 15 * 60
+
+
+def _guardar_token_smart(token):
+    if token:
+        _TOKEN_SMART["token"] = token
+        _TOKEN_SMART["em"] = _time.monotonic()
+
+
+async def _token_smart(forcar: bool = False):
+    """Devolve (token, veio_do_cache)."""
+    t = _TOKEN_SMART["token"]
+    if not forcar and t and _time.monotonic() - _TOKEN_SMART["em"] < TOKEN_SMART_TTL:
+        return t, True
+    t = await get_token()  # get_token ja guarda
+    return t, False
+
+
+def _headers_smart(token: str):
+    return {"App_key": APP_KEY, "Authorization": token, "Content-Type": "application/json"}
+
+
+def _json_ou_none(r):
     try:
-        token = await get_token()
-        headers = {"App_key": APP_KEY, "Authorization": token, "Content-Type": "application/json"}
+        return r.json()
+    except Exception:
+        return None
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}", headers=headers)
-            empresa = r.json() if r.status_code == 200 else {}
 
-            r = await client.get(f"{SEBRAE_API}/agente/{req.codigo_cliente}/vinculo", headers=headers)
-            socios = r.json() if r.status_code == 200 else []
+def _tem_valor(v) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, str):
+        return v.strip() != ""
+    return True
 
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-        cliente_resp = supabase.table("clientes").select("organizacao_id, usuario_id").eq("id", req.cliente_id).single().execute()
-        cliente_data = cliente_resp.data or {}
-        org_id = cliente_data.get("organizacao_id")
-        user_id = cliente_data.get("usuario_id")
+def _so_digitos(s) -> str:
+    return re.sub(r"\D", "", str(s or ""))
 
-        endereco = empresa.get("endereco") or {}
-        logradouro = endereco.get("logradouro") or {}
-        bairro_obj = endereco.get("bairro") or {}
-        geo = endereco.get("geoLocalizacao") or {}
-        cep_raw = str(endereco.get("cep") or "")
 
-        data_abertura = None
-        data_str = empresa.get("dataAberturaNascimento")
-        if data_str:
-            data_abertura = data_str[:10]
+def _norm_email(s) -> str:
+    return (s or "").strip().lower()
 
-        supabase.table("clientes").update({
-            "nome_fantasia": empresa.get("nomeFantasia") or empresa.get("nome"),
-            "data_abertura": data_abertura,
-            "rua": logradouro.get("descricao"),
-            "numero": endereco.get("numero"),
-            "complemento": endereco.get("complemento"),
-            "bairro": bairro_obj.get("descricao"),
-            "cep": cep_raw,
-            "latitude": geo.get("latitude"),
-            "longitude": geo.get("longitude"),
-        }).eq("id", req.cliente_id).execute()
 
-        for tel in (empresa.get("telefones") or []):
+def _norm_nome(s) -> str:
+    # igual ao motor: lower(regexp_replace(trim(nome), '\s+', ' ', 'g'))
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+
+def _idade_de(data_iso):
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", data_iso or "")
+    if not m:
+        return None
+    ano, mes, dia = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    hoje = _dt.date.today()
+    idade = hoje.year - ano - (1 if (hoje.month, hoje.day) < (mes, dia) else 0)
+    return idade if 0 <= idade < 130 else None
+
+
+class _SmartRecusou(Exception):
+    """A empresa nao voltou do Smart (token velho, fora do ar) -- vale tentar com login novo."""
+
+
+class _SmartSemCadastro(Exception):
+    """O Smart respondeu, mas o codigo nao existe (ou e de outra empresa) -- login novo nao ajuda."""
+
+
+async def _ler_cadastro_com_token(codigo: str, token: str):
+    h = _headers_smart(token)
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(f"{SEBRAE_API}/agente/{codigo}", headers=h)
+        if r.status_code == 404:
+            raise _SmartSemCadastro(f"Codigo {codigo} nao encontrado no Smart")
+        empresa = _json_ou_none(r) if r.status_code == 200 else None
+        if not isinstance(empresa, dict):
+            raise _SmartRecusou(f"Smart nao devolveu o cadastro do codigo {codigo} (HTTP {r.status_code})")
+        if _so_digitos(empresa.get("codigo")).lstrip("0") != codigo.lstrip("0"):
+            raise _SmartSemCadastro(f"Smart devolveu outro codigo ({empresa.get('codigo')}) para {codigo}")
+
+        # Daqui pra baixo, falha vira "sem dado" (como antes): socio, atividade
+        # e contato do socio sao complemento -- nao travam o Cadastro do card.
+        r = await client.get(f"{SEBRAE_API}/agente/{codigo}/vinculo", headers=h)
+        vinculos = _json_ou_none(r) if r.status_code == 200 else None
+        vinculos = vinculos if isinstance(vinculos, list) else []
+
+        r = await client.get(f"{SEBRAE_API}/pj/{codigo}", headers=h)
+        pj = _json_ou_none(r) if r.status_code == 200 else None
+        pj = pj if isinstance(pj, dict) else {}
+
+        socios_pf = {}
+        for v in vinculos:
+            cod_pf = v.get("codigo") if isinstance(v, dict) else None
+            if not cod_pf:
+                continue
+            r = await client.get(f"{SEBRAE_API}/agente/{cod_pf}", headers=h)
+            pf = _json_ou_none(r) if r.status_code == 200 else None
+            socios_pf[str(cod_pf)] = pf if isinstance(pf, dict) else {}
+
+    return {"empresa": empresa, "vinculos": vinculos, "pj": pj, "socios_pf": socios_pf}
+
+
+async def _ler_cadastro_smart(codigo: str):
+    token, do_cache = await _token_smart()
+    try:
+        return await _ler_cadastro_com_token(codigo, token)
+    except _SmartRecusou:
+        if not do_cache:
+            raise
+        token, _ = await _token_smart(forcar=True)
+        return await _ler_cadastro_com_token(codigo, token)
+
+
+class _ContatosDoCliente:
+    """Telefones e e-mails do cliente inteiro (empresa + socios), com a mesma
+    chave da limpeza do motor. O dono de cada contato e quem o tem ha mais
+    tempo -- o mesmo que a limpeza mantem. Contato que ja existe em qualquer
+    ponto do cliente nao ganha copia; marca do Smart (WhatsApp, principal,
+    tipo) so e gravada no contato da propria empresa/pessoa."""
+
+    def __init__(self, supabase, cliente_id, pessoa_ids, org_id, user_id):
+        self.sb, self.org_id, self.user_id = supabase, org_id, user_id
+        refs = [cliente_id] + list(pessoa_ids)
+        self.tel = {}
+        self.em = {}
+        tels = (
+            supabase.table("telefones").select("id, referencia_id, numero")
+            .in_("referencia_id", refs).order("created_at").order("id").execute().data or []
+        )
+        for t in tels:
+            d = _so_digitos(t.get("numero"))
+            if d:
+                self.tel.setdefault(d, (t["referencia_id"], t["id"]))
+        ems = (
+            supabase.table("emails").select("id, referencia_id, endereco")
+            .in_("referencia_id", refs).order("created_at").order("id").execute().data or []
+        )
+        for e in ems:
+            k = _norm_email(e.get("endereco"))
+            if k:
+                self.em.setdefault(k, (e["referencia_id"], e["id"]))
+
+    def telefones(self, ref_id, tipo, lista):
+        for tel in lista or []:
+            if not isinstance(tel, dict):
+                continue
             numero = tel.get("telefone") or tel.get("numero")
-            if numero:
-                supabase.table("telefones").insert({
-                    "organizacao_id": org_id,
-                    "usuario_id": user_id,
-                    "referencia_id": req.cliente_id,
-                    "numero": numero,
-                    "tipo": "empresa",
-                }).execute()
+            d = _so_digitos(numero)
+            if not d:
+                continue
+            marcas = {}
+            if tel.get("whatsapp") is not None:
+                marcas["whatsapp"] = bool(tel.get("whatsapp"))
+            if tel.get("principal") is not None:
+                marcas["principal"] = bool(tel.get("principal"))
+            tipo_tel = tel.get("tipoTelefone")
+            tipo_tel = tipo_tel.get("descricao") if isinstance(tipo_tel, dict) else None
+            if _tem_valor(tipo_tel):
+                marcas["tipo_telefone"] = tipo_tel
+            dono = self.tel.get(d)
+            if dono:
+                if dono[0] == ref_id and marcas:
+                    self.sb.table("telefones").update(marcas).eq("id", dono[1]).execute()
+                continue
+            resp = self.sb.table("telefones").insert({
+                "organizacao_id": self.org_id,
+                "usuario_id": self.user_id,
+                "referencia_id": ref_id,
+                "numero": str(numero).strip(),
+                "tipo": tipo,
+                **marcas,
+            }).execute()
+            if resp.data:
+                self.tel[d] = (ref_id, resp.data[0]["id"])
 
-        # Emails da empresa (originais) — inseridos depois, junto do fallback cruzado
-        emails_empresa = [
-            em.get("email") for em in (empresa.get("emails") or []) if em.get("email")
+    def emails(self, ref_id, tipo, lista):
+        """lista = [(endereco, principal_ou_None)]."""
+        for endereco, principal in lista or []:
+            k = _norm_email(endereco)
+            if not k:
+                continue
+            dono = self.em.get(k)
+            if dono:
+                if dono[0] == ref_id and principal is not None:
+                    self.sb.table("emails").update({"principal": principal}).eq("id", dono[1]).execute()
+                continue
+            resp = self.sb.table("emails").insert({
+                "organizacao_id": self.org_id,
+                "usuario_id": self.user_id,
+                "referencia_id": ref_id,
+                "endereco": endereco.strip(),
+                "tipo": tipo,
+                "principal": principal,
+            }).execute()
+            if resp.data:
+                self.em[k] = (ref_id, resp.data[0]["id"])
+
+
+def _emails_smart(agente: dict):
+    return [
+        (em.get("email"), None if em.get("principal") is None else bool(em.get("principal")))
+        for em in (agente.get("emails") or [])
+        if isinstance(em, dict) and _tem_valor(em.get("email"))
+    ]
+
+
+def _gravar_cadastro_smart(supabase, cliente_id: str, dados: dict):
+    cli = supabase.table("clientes").select("organizacao_id, usuario_id").eq("id", cliente_id).single().execute().data or {}
+    org_id = cli.get("organizacao_id")
+    user_id = cli.get("usuario_id")
+    empresa, pj = dados["empresa"], dados["pj"]
+
+    # --- cliente: so o que veio preenchido ---------------------------------
+    endereco = empresa.get("endereco") or {}
+    logradouro = endereco.get("logradouro") or {}
+    bairro_obj = endereco.get("bairro") or {}
+    geo = endereco.get("geoLocalizacao") or {}
+    campos = {
+        "nome_fantasia": empresa.get("nomeFantasia") or empresa.get("nome"),
+        "data_abertura": (empresa.get("dataAberturaNascimento") or "")[:10] or None,
+        "rua": logradouro.get("descricao"),
+        "numero": endereco.get("numero"),
+        "complemento": endereco.get("complemento"),
+        "bairro": bairro_obj.get("descricao"),
+        "cep": str(endereco.get("cep") or "") or None,
+        "objeto_social": pj.get("objetoContrato"),
+        "setor": (pj.get("setor") or {}).get("descricao"),
+        "natureza_juridica": (pj.get("naturezaJuridica") or {}).get("descricao"),
+        "enquadramento": (pj.get("enquadramentoTributario") or {}).get("descricao"),
+        "num_empregados": pj.get("numeroEmpregados") if isinstance(pj.get("numeroEmpregados"), int) else None,
+    }
+    atualizar = {k: v for k, v in campos.items() if _tem_valor(v)}
+    # coordenada so entra com o par completo -- metade apagaria o pino do mapa
+    if _tem_valor(geo.get("latitude")) and _tem_valor(geo.get("longitude")):
+        atualizar["latitude"] = geo.get("latitude")
+        atualizar["longitude"] = geo.get("longitude")
+    atualizar["smart_atualizado_em"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    supabase.table("clientes").update(atualizar).eq("id", cliente_id).execute()
+
+    # --- socios: pelo codigo do Smart; sem codigo, pelo nome (como o motor) --
+    atuais = (
+        supabase.table("pessoas").select("id, codigo_socio, nome")
+        .eq("cliente_id", cliente_id).order("created_at").order("id").execute().data or []
+    )
+    por_codigo, por_nome = {}, {}
+    for p in atuais:
+        if _tem_valor(p.get("codigo_socio")):
+            por_codigo.setdefault(str(p["codigo_socio"]).strip(), []).append(p)
+        por_nome.setdefault(_norm_nome(p.get("nome")), []).append(p)
+
+    contatos = _ContatosDoCliente(supabase, cliente_id, [p["id"] for p in atuais], org_id, user_id)
+
+    # empresa primeiro: contato que for dela e do socio fica com ela (e quem a
+    # limpeza do motor manteria -- o da empresa e gravado antes)
+    contatos.telefones(cliente_id, "empresa", empresa.get("telefones"))
+    emails_empresa = _emails_smart(empresa)
+    socios_emails = []
+    for v in dados["vinculos"]:
+        if isinstance(v, dict) and v.get("codigo"):
+            socios_emails.extend(_emails_smart(dados["socios_pf"].get(str(v["codigo"])) or {}))
+    if not emails_empresa and socios_emails:
+        # fallback de antes: empresa sem e-mail fica com o do 1o socio que tiver
+        emails_empresa = [(socios_emails[0][0], None)]
+    contatos.emails(cliente_id, "empresa", emails_empresa)
+
+    nomes = []
+    for v in dados["vinculos"]:
+        if not isinstance(v, dict) or not v.get("codigo"):
+            continue
+        cod = str(v["codigo"]).strip()
+        pf = dados["socios_pf"].get(cod) or {}
+        nome = pf.get("nome") or pf.get("descricao") or v.get("nome") or v.get("descricao")
+        vinculo = ((v.get("vinculo") or {}).get("descricao") or "").strip() or None
+        if vinculo and v.get("ativo") is False:
+            vinculo = f"{vinculo} (inativo)"
+        nascimento = (pf.get("dataAberturaNascimento") or "")[:10] or None
+        extra = {"vinculo": vinculo, "data_nascimento": nascimento, "idade": _idade_de(nascimento)}
+        extra = {k: x for k, x in extra.items() if _tem_valor(x)}
+
+        # pelo nome so quem esta sem codigo (cadastro manual/antigo): homonimo
+        # com outro codigo e outra pessoa e nao recebe dado deste socio
+        existentes = por_codigo.get(cod) or [
+            p for p in por_nome.get(_norm_nome(nome), []) if not _tem_valor(p.get("codigo_socio"))
         ]
-
-        pessoas_salvas = []
-        socios_info = []  # [{"pessoa_id": ..., "emails": [...]}]
-        async with httpx.AsyncClient(timeout=30) as client:
-            for socio in (socios if isinstance(socios, list) else []):
-                cod_pf = socio.get("codigo")
-                if not cod_pf:
-                    continue
-
-                r = await client.get(f"{SEBRAE_API}/agente/{cod_pf}", headers=headers)
-                pf = r.json() if r.status_code == 200 else {}
-
-                pessoa_resp = supabase.table("pessoas").insert({
-                    "organizacao_id": org_id,
-                    "usuario_id": user_id,
-                    "cliente_id": req.cliente_id,
-                    "nome": pf.get("nome") or pf.get("descricao"),
-                    "codigo_socio": str(cod_pf),
-                }).execute()
-
-                pessoa_id = pessoa_resp.data[0]["id"] if pessoa_resp.data else None
-
-                for tel in (pf.get("telefones") or []):
-                    numero = tel.get("telefone") or tel.get("numero")
-                    if numero and pessoa_id:
-                        supabase.table("telefones").insert({
-                            "organizacao_id": org_id,
-                            "usuario_id": user_id,
-                            "referencia_id": pessoa_id,
-                            "numero": numero,
-                            "tipo": "socio",
-                        }).execute()
-
-                emails_pf = [
-                    em.get("email") for em in (pf.get("emails") or []) if em.get("email")
-                ]
-                socios_info.append({"pessoa_id": pessoa_id, "emails": emails_pf})
-                pessoas_salvas.append(pf.get("nome") or str(cod_pf))
-
-        # Fallback cruzado empresa <-> socio (avalia o estado ORIGINAL):
-        # - empresa sem email  -> pega do 1o socio (na ordem) que tiver
-        # - socio sem email    -> pega do email original da empresa
-        # Nao copia email de um socio para outro socio.
-        email_empresa_orig = emails_empresa[0] if emails_empresa else None
-        email_socio_disp = next((s["emails"][0] for s in socios_info if s["emails"]), None)
-        if not email_empresa_orig and email_socio_disp:
-            emails_empresa = [email_socio_disp]
-
-        for endereco_email in emails_empresa:
-            supabase.table("emails").insert({
+        if existentes:
+            ids = [p["id"] for p in existentes]
+            sem_codigo = [p["id"] for p in existentes if not _tem_valor(p.get("codigo_socio"))]
+            if extra:
+                supabase.table("pessoas").update(extra).in_("id", ids).execute()
+            if sem_codigo:
+                supabase.table("pessoas").update({"codigo_socio": cod}).in_("id", sem_codigo).execute()
+            pessoa_id = ids[0]
+        else:
+            if not _tem_valor(nome):
+                continue
+            resp = supabase.table("pessoas").insert({
                 "organizacao_id": org_id,
                 "usuario_id": user_id,
-                "referencia_id": req.cliente_id,
-                "endereco": endereco_email,
-                "tipo": "empresa",
+                "cliente_id": cliente_id,
+                "nome": nome,
+                "codigo_socio": cod,
+                **extra,
             }).execute()
-
-        for s in socios_info:
-            if not s["pessoa_id"]:
+            if not resp.data:
                 continue
-            lista_emails = s["emails"]
-            if not lista_emails and email_empresa_orig:
-                lista_emails = [email_empresa_orig]
-            for endereco_email in lista_emails:
-                supabase.table("emails").insert({
-                    "organizacao_id": org_id,
-                    "usuario_id": user_id,
-                    "referencia_id": s["pessoa_id"],
-                    "endereco": endereco_email,
-                    "tipo": "socio",
-                }).execute()
+            pessoa_id = resp.data[0]["id"]
+            novo = {"id": pessoa_id, "codigo_socio": cod, "nome": nome}
+            por_codigo[cod] = [novo]
+            por_nome.setdefault(_norm_nome(nome), []).append(novo)
 
+        contatos.telefones(pessoa_id, "socio", pf.get("telefones"))
+        # socio sem e-mail proprio nao ganha copia do da empresa: a limpeza do
+        # motor apagaria a copia (e o selo de cadastro ja olha empresa + socios)
+        contatos.emails(pessoa_id, "socio", _emails_smart(pf))
+        nomes.append(nome or cod)
+
+    return nomes
+
+
+@app.post("/buscar-cliente")
+async def buscar_cliente(req: ScrapeRequest):
+    # o codigo vai no caminho da URL do Smart: so digitos (barra ou ".." aqui
+    # leriam outra rota da API do Sebrae com o token da conta)
+    codigo = (req.codigo_cliente or "").strip()
+    if not re.fullmatch(r"\d{1,15}", codigo):
+        raise HTTPException(status_code=400, detail=f"Codigo Smart invalido: {req.codigo_cliente!r}")
+    try:
+        dados = await _ler_cadastro_smart(codigo)
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        nomes = _gravar_cadastro_smart(supabase, req.cliente_id, dados)
+        empresa = dados["empresa"]
         return {
             "sucesso": True,
             "empresa": empresa.get("nomeFantasia") or empresa.get("nome"),
-            "socios": pessoas_salvas,
+            "socios": nomes,
         }
 
     except Exception as e:
@@ -1926,6 +2152,7 @@ async def analise_risco(req: ScrapeRequest):
                     token = _extrair_token_da_url(page.url)
                 if not token:
                     raise Exception(f"Token nao encontrado na URL: {page.url}")
+                _guardar_token_smart(token)
                 headers = {"App_key": APP_KEY, "Authorization": token, "Content-Type": "application/json"}
 
                 async with httpx.AsyncClient(timeout=40) as client:
@@ -2104,6 +2331,7 @@ async def graduar_cliente_maquina(req: GraduarRequest):
                     return {"sucesso": True, "encontrado": False}
 
                 token = _extrair_token_da_url(popup_page.url)
+                _guardar_token_smart(token)
                 visitas = await _contar_visitas_pap(popup_page, codigo)
             finally:
                 try:
@@ -2120,15 +2348,14 @@ async def graduar_cliente_maquina(req: GraduarRequest):
             "origem": "sebrae",
         }
         if endereco:
-            update_payload.update({
-                "cep": endereco.get("cep"),
-                "rua": endereco.get("rua"),
-                "numero": endereco.get("numero"),
-                "complemento": endereco.get("complemento"),
-                "bairro": endereco.get("bairro"),
-                "latitude": endereco.get("latitude"),
-                "longitude": endereco.get("longitude"),
-            })
+            # campo vazio do Smart nao apaga o do Apollo; coordenada so em par
+            # (antes gravava None e o pino sumia do mapa -- 19/10/26)
+            for campo in ("cep", "rua", "numero", "complemento", "bairro"):
+                if _tem_valor(endereco.get(campo)):
+                    update_payload[campo] = endereco.get(campo)
+            if _tem_valor(endereco.get("latitude")) and _tem_valor(endereco.get("longitude")):
+                update_payload["latitude"] = endereco.get("latitude")
+                update_payload["longitude"] = endereco.get("longitude")
 
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         supabase.table("clientes").update(update_payload).eq("id", req.cliente_id).execute()
@@ -2223,6 +2450,7 @@ async def get_token() -> str:
             url_atual = popup_page.url
             token = _extrair_token_da_url(url_atual)
             if token:
+                _guardar_token_smart(token)
                 return token
             raise Exception(f"Token nao encontrado na URL: {url_atual}")
         finally:
