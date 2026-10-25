@@ -1587,8 +1587,8 @@ async def nf_incluir(req: IncluirNFRequest):
 
 # Token do Smart reaproveitado por alguns minutos: cada login leva ~30 s e a
 # conta tem sessao unica (Decisao 4). Os logins do Smart (get_token, analise
-# de risco, graduacao) guardam o token aqui; so /buscar-cliente le o cache
-# e, se o Smart recusar o token guardado, faz login de novo uma vez.
+# de risco, graduacao) guardam o token aqui; /buscar-cliente e /buscar-pesquisas
+# leem o cache e, se o Smart recusar o token guardado, fazem login de novo uma vez.
 _TOKEN_SMART = {"token": None, "em": 0.0}
 TOKEN_SMART_TTL = 15 * 60
 
@@ -1931,26 +1931,45 @@ async def buscar_cliente(req: ScrapeRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def _pesquisas_finalizadas(client, codigo):
+    """(token, lista de pesquisas finalizadas do cliente) com o token guardado (25/10/26:
+    era um login de ~30 s por cliente). O banco de perguntas recusa token velho com 500,
+    nao 401 (medido) -- 401/403/500, ou 200 sem lista, com o token do cache = login novo
+    uma vez. Fora do ar (502/503) ou 404 nao gastam login. 204 = cliente sem pesquisa.
+    Falha vira erro, e nao "0 pesquisas" calado."""
+    url = f"{BANCO_PERGUNTAS_API}/usuario/pj/{codigo}/pesquisas-respondidas-finalizadas"
+
+    def ler(r):
+        if r.status_code == 204 or (r.status_code == 200 and not r.text):
+            return []
+        dados = _json_ou_none(r) if r.status_code == 200 else None
+        return dados if isinstance(dados, list) else None
+
+    token, do_cache = await _token_smart()
+    r = await client.get(url, headers=_headers_smart(token))
+    lista = ler(r)
+    if lista is None and do_cache and r.status_code in (200, 401, 403, 500):
+        token, _ = await _token_smart(forcar=True)
+        r = await client.get(url, headers=_headers_smart(token))
+        lista = ler(r)
+    if lista is None:
+        raise Exception(f"Smart nao devolveu as pesquisas do codigo {codigo} (HTTP {r.status_code})")
+    return token, lista
+
+
 @app.post("/buscar-pesquisas")
 async def buscar_pesquisas(req: ScrapeRequest):
     try:
-        token = await get_token()
-        headers = {"App_key": APP_KEY, "Authorization": token, "Content-Type": "application/json"}
-
         async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.get(
-                f"{BANCO_PERGUNTAS_API}/usuario/pj/{req.codigo_cliente}/pesquisas-respondidas-finalizadas",
-                headers=headers
-            )
-            pesquisas = r.json() if r.status_code == 200 and r.text else []
-            if not isinstance(pesquisas, list):
-                pesquisas = []
+            token, pesquisas = await _pesquisas_finalizadas(client, req.codigo_cliente)
+            headers = _headers_smart(token)
 
             supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
             cliente_resp = supabase.table("clientes").select("organizacao_id").eq("id", req.cliente_id).single().execute()
             org_id = (cliente_resp.data or {}).get("organizacao_id")
 
             salvas = 0
+            falhas = 0
             for pesq in pesquisas:
                 if not pesq.get("finalizada"):
                     continue
@@ -1965,6 +1984,10 @@ async def buscar_pesquisas(req: ScrapeRequest):
                     "questionarios": []
                 }
 
+                # Questionario que falhou (token derrubado por outro login no meio, Smart
+                # instavel) = pesquisa NAO e regravada: o upsert por cima apagaria a versao
+                # completa guardada antes (25/10/26).
+                incompleta = False
                 for quest in (pesq.get("questionarios") or []):
                     uuid_q = quest.get("uuidQuestionario")
                     titulo_q = quest.get("tituloQuestionarioTxt")
@@ -1974,9 +1997,10 @@ async def buscar_pesquisas(req: ScrapeRequest):
                         f"?uuidQuestionario={uuid_q}&codResposta={cod_resposta}",
                         headers=headers
                     )
-                    if rel.status_code != 200:
-                        continue
-                    rel_data = rel.json()
+                    rel_data = _json_ou_none(rel) if rel.status_code == 200 else None
+                    if not isinstance(rel_data, dict):
+                        incompleta = True
+                        break
                     if not conteudo["razao_social"]:
                         conteudo["razao_social"] = rel_data.get("razaoSocial")
 
@@ -2021,6 +2045,9 @@ async def buscar_pesquisas(req: ScrapeRequest):
                         "perguntas": perguntas_extraidas
                     })
 
+                if incompleta:
+                    falhas += 1
+                    continue
                 supabase.table("pesquisas_smart_cliente").upsert({
                     "cliente_id": req.cliente_id,
                     "organizacao_id": org_id,
@@ -2030,7 +2057,7 @@ async def buscar_pesquisas(req: ScrapeRequest):
                 }, on_conflict="cliente_id,tipo,data_preenchimento").execute()
                 salvas += 1
 
-            return {"sucesso": True, "pesquisas_salvas": salvas, "total_encontradas": len(pesquisas)}
+            return {"sucesso": True, "pesquisas_salvas": salvas, "pesquisas_com_falha": falhas, "total_encontradas": len(pesquisas)}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
