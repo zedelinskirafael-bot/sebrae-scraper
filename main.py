@@ -1994,6 +1994,13 @@ async def buscar_pesquisas(req: ScrapeRequest):
                                         valor = opt.get("valorString")
                                         if cod and valor:
                                             opcoes[cod] = valor
+                                        # Opção ligada a um valor de catálogo (ex.: área de interesse
+                                        # do DUG: "Finanças" -> 952158 "Finanças."): a resposta grava
+                                        # o código do CATÁLOGO, não o da lista. Sem isto a área
+                                        # escolhida chegava vazia (25/10/26, Decisão 57 do Apollo).
+                                        cod_cat = (opt.get("valorDominio") or {}).get("cod")
+                                        if cod_cat and valor and cod_cat not in opcoes:
+                                            opcoes[cod_cat] = valor
                             resposta = p.get("resposta") or {}
                             valores = []
                             for vr in resposta.get("valoresResposta") or []:
