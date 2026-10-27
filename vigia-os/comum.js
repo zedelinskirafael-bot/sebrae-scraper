@@ -132,10 +132,12 @@ function criar({ nome, prefixoEstado, minutosPorRodada, env = process.env }) {
 
   // Falha de leitura (portal fora, senha recusada): conta e, a partir de
   // FALHAS_PARA_AVISAR falhas seguidas, avisa so o 1o destino (problema
-  // tecnico e do Rafael), uma vez por dia.
+  // tecnico e do Rafael), uma vez por dia. Guarda quando a queda comecou e se
+  // o alerta saiu, para leituraOk avisar a volta.
   async function tratarFalha(db, erro, titulo) {
     const falhas = parseInt((await estadoLer(db, "falhas_seguidas")) || "0", 10) + 1;
     await estadoGravar(db, "falhas_seguidas", falhas);
+    if (falhas === 1) await estadoGravar(db, "fora_desde", new Date().toISOString());
     await estadoGravar(db, "ultimo_erro", String(erro).slice(0, 500));
     log(`falha ${falhas}: ${erro}`);
     const limite = parseInt(FALHAS_PARA_AVISAR, 10);
@@ -150,11 +152,42 @@ function criar({ nome, prefixoEstado, minutosPorRodada, env = process.env }) {
         `⚠️ *${titulo} — ${nomeConta}*\nNão consigo acessar o portal há ${falhas} rodadas (~${horas}h).\nMotivo: ${motivo}`,
         { apenasPrimeiro: true }
       );
-      if (ok) await estadoGravar(db, "falha_avisada_em", hoje);
+      if (ok) {
+        await estadoGravar(db, "falha_avisada_em", hoje);
+        await estadoGravar(db, "queda_avisada", "sim");
+      }
     }
   }
 
-  async function leituraOk(db) {
+  // "24/10 17:00" no horario de Brasilia.
+  const quandoBR = (iso) =>
+    new Date(iso).toLocaleString("pt-BR", {
+      timeZone: TZ, day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit",
+    }).replace(",", "");
+
+  function textoVoltou(titulo, foraDesde) {
+    let periodo = "";
+    if (foraDesde && !isNaN(new Date(foraDesde))) {
+      const min = Math.max(0, Math.round((Date.now() - new Date(foraDesde)) / 60000));
+      const dur = min < 60 ? `${min} min` : `${Math.floor(min / 60)}h${String(min % 60).padStart(2, "0")}`;
+      periodo = `\nFicou fora de ${quandoBR(foraDesde)} até ${quandoBR(new Date().toISOString())} (${dur}).`;
+    }
+    return (
+      `✅ *${titulo} — ${nomeConta}*\nO portal voltou e estou lendo de novo.${periodo}\n` +
+      `Se algo mudou nesse período, o aviso chega em seguida; se não chegar nada, não mudou nada.`
+    );
+  }
+
+  // Leitura deu certo. Se o alerta de queda saiu, avisa a volta para a mesma
+  // pessoa: sem isso, quem recebeu "nao consigo acessar" fica sem saber se o
+  // portal voltou. Envio que falhou mantem a marca e retenta na proxima rodada.
+  async function leituraOk(db, titulo) {
+    if ((await estadoLer(db, "queda_avisada")) === "sim") {
+      const foraDesde = await estadoLer(db, "fora_desde");
+      const ok = await enviarWhatsApp(textoVoltou(titulo, foraDesde), { apenasPrimeiro: true });
+      if (ok) await estadoGravar(db, "queda_avisada", "");
+      else log("aviso de volta do portal falhou; fica para a proxima rodada");
+    }
     await estadoGravar(db, "falhas_seguidas", 0);
     await estadoGravar(db, "ultima_leitura_ok", new Date().toISOString());
   }
@@ -172,7 +205,7 @@ function criar({ nome, prefixoEstado, minutosPorRodada, env = process.env }) {
 
   return {
     log, nomeConta, CONTA, destinos, enviarWhatsApp, chamarScraper,
-    estadoLer, estadoGravar, tratarFalha, leituraOk, comBanco,
+    estadoLer, estadoGravar, tratarFalha, leituraOk, comBanco, textoVoltou,
   };
 }
 

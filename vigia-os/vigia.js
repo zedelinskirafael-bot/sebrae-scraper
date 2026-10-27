@@ -65,7 +65,7 @@ async function main() {
       await v.tratarFalha(db, e.message || e, "Vigia de O.S. Sebrae");
       return;
     }
-    await v.leituraOk(db);
+    await v.leituraOk(db, "Vigia de O.S. Sebrae");
 
     const vistas = await db.query(
       "select os, fluxo from sebrae_os_vistas where conta=$1", [CONTA]

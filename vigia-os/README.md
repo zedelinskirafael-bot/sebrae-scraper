@@ -69,6 +69,12 @@ Mudança só em "Última interação" (nome do analista) ou no valor grava em si
 - **Primeira rodada = baseline**: grava tudo e não avisa.
 - **Aviso que falhou não grava**: na próxima rodada a mudança é detectada de novo e o envio
   é retentado (sem duplicar para quem já recebeu).
+- **Avisa a volta** (desde 27/10/2026): se o alerta de queda saiu, a primeira leitura boa
+  manda "✅ O portal voltou", com o período fora do ar, para a mesma pessoa que recebeu o
+  alerta. Queda curta (sem alerta) volta em silêncio. Estado: `fora_desde` (gravado na 1ª
+  falha) e `queda_avisada` (`sim` até o aviso de volta sair; envio que falhou retenta).
+  Motivo: em 24/10 o portal caiu das 17h às 19h, o alerta chegou e o Rafael não soube que
+  tinha voltado.
 - **Layout mudou** (portal diz que há linhas/páginas e o leitor não lê nenhuma): falha alta,
   nunca `[]` como sucesso.
 - **Sessão única do Sebrae**: o scraper serializa toda rota que abre navegador

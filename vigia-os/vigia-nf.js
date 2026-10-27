@@ -114,7 +114,7 @@ async function main() {
       await v.tratarFalha(db, e.message || e, "Vigia de notas Sebrae");
       return;
     }
-    await v.leituraOk(db);
+    await v.leituraOk(db, "Vigia de notas Sebrae");
 
     const vistas = await db.query(
       `select codigo, status, valor, ultima_interacao,
