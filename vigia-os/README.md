@@ -4,8 +4,10 @@ O portal do Sebrae não avisa nada: nem quando cai uma O.S. para aceite, nem qua
 nota fiscal muda de status. Dois vigias na KVM8 fazem isso com o mesmo scraper, o mesmo
 `.env` por conta e o mesmo canal: WhatsApp pessoal do **Rafael e da Geovana** pela Evolution
 (`claudinho`), com pausa aleatória de 30 s a 2 min entre os dois envios. Todo aviso diz de
-quem é a conta no título ("— Rafael" / "— Geovana"). Alerta técnico (portal fora, senha) vai
-só para o Rafael.
+quem é a conta no título ("— Rafael" / "— Geovana"). Alerta técnico (portal fora, senha, e a
+volta do portal) vai só para o Rafael, nas duas contas: `DESTINO_TECNICO` nos dois `.env`
+(desde 27/10/2026; sem ele, vai para o 1º de `DESTINOS` — antes disso a conta da Geovana
+alertava a própria Geovana).
 
 | Vigia | Tela do portal | Rodada | Script | Tabela |
 |-------|----------------|--------|--------|--------|
@@ -70,8 +72,8 @@ Mudança só em "Última interação" (nome do analista) ou no valor grava em si
 - **Aviso que falhou não grava**: na próxima rodada a mudança é detectada de novo e o envio
   é retentado (sem duplicar para quem já recebeu).
 - **Avisa a volta** (desde 27/10/2026): se o alerta de queda saiu, a primeira leitura boa
-  manda "✅ O portal voltou", com o período fora do ar, para a mesma pessoa que recebeu o
-  alerta. Queda curta (sem alerta) volta em silêncio. Estado: `fora_desde` (gravado na 1ª
+  manda "✅ O portal voltou", com o período fora do ar, para o `DESTINO_TECNICO` (o mesmo
+  do alerta). Queda curta (sem alerta) volta em silêncio. Estado: `fora_desde` (gravado na 1ª
   falha) e `queda_avisada` (`sim` até o aviso de volta sair; envio que falhou retenta).
   Motivo: em 24/10 o portal caiu das 17h às 19h, o alerta chegou e o Rafael não soube que
   tinha voltado.

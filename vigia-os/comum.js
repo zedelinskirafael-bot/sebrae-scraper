@@ -38,6 +38,7 @@ function criar({ nome, prefixoEstado, minutosPorRodada, env = process.env }) {
     EVO_KEY,
     EVO_INSTANCE = "claudinho",
     DESTINOS,
+    DESTINO_TECNICO,
     CONTA = "rafael",
     INTERVALO_MIN_S = "30",
     INTERVALO_MAX_S = "120",
@@ -51,6 +52,10 @@ function criar({ nome, prefixoEstado, minutosPorRodada, env = process.env }) {
 
   // Quem recebe: lista separada por virgula, dono da conta primeiro.
   const destinos = (DESTINOS || "").split(",").map((s) => s.trim()).filter(Boolean);
+
+  // Alerta tecnico (portal fora e a volta dele) vai so para o Rafael nas duas
+  // contas (decisao dele, 27/10/2026): DESTINO_TECNICO no .env; sem ele, o 1o destino.
+  const destinoTecnico = (DESTINO_TECNICO || "").trim() || destinos[0];
 
   function pausaAleatoriaMs() {
     const min = parseInt(INTERVALO_MIN_S, 10) * 1000;
@@ -75,12 +80,12 @@ function criar({ nome, prefixoEstado, minutosPorRodada, env = process.env }) {
   // Manda para todos os destinos, com pausa aleatoria entre um e outro para a
   // instancia nao disparar duas mensagens iguais no mesmo segundo. Devolve true
   // se pelo menos um recebeu (ai nao retenta, para nao duplicar no que recebeu).
-  async function enviarWhatsApp(texto, { apenasPrimeiro = false } = {}) {
+  async function enviarWhatsApp(texto, { tecnico = false } = {}) {
     if (!EVO_URL || !EVO_KEY || destinos.length === 0) {
       log("sem credencial Evolution/DESTINOS; mensagem nao enviada:", texto);
       return false;
     }
-    const alvos = apenasPrimeiro ? destinos.slice(0, 1) : destinos;
+    const alvos = tecnico ? [destinoTecnico] : destinos;
     let algumOk = false;
     for (let i = 0; i < alvos.length; i++) {
       if (i > 0) {
@@ -131,8 +136,7 @@ function criar({ nome, prefixoEstado, minutosPorRodada, env = process.env }) {
   }
 
   // Falha de leitura (portal fora, senha recusada): conta e, a partir de
-  // FALHAS_PARA_AVISAR falhas seguidas, avisa so o 1o destino (problema
-  // tecnico e do Rafael), uma vez por dia. Guarda quando a queda comecou e se
+  // FALHAS_PARA_AVISAR falhas seguidas, avisa so o destino tecnico, uma vez por dia. Guarda quando a queda comecou e se
   // o alerta saiu, para leituraOk avisar a volta.
   async function tratarFalha(db, erro, titulo) {
     const falhas = parseInt((await estadoLer(db, "falhas_seguidas")) || "0", 10) + 1;
@@ -150,7 +154,7 @@ function criar({ nome, prefixoEstado, minutosPorRodada, env = process.env }) {
       const horas = Math.round((falhas * minutosPorRodada) / 6) / 10;
       const ok = await enviarWhatsApp(
         `⚠️ *${titulo} — ${nomeConta}*\nNão consigo acessar o portal há ${falhas} rodadas (~${horas}h).\nMotivo: ${motivo}`,
-        { apenasPrimeiro: true }
+        { tecnico: true }
       );
       if (ok) {
         await estadoGravar(db, "falha_avisada_em", hoje);
@@ -184,7 +188,7 @@ function criar({ nome, prefixoEstado, minutosPorRodada, env = process.env }) {
   async function leituraOk(db, titulo) {
     if ((await estadoLer(db, "queda_avisada")) === "sim") {
       const foraDesde = await estadoLer(db, "fora_desde");
-      const ok = await enviarWhatsApp(textoVoltou(titulo, foraDesde), { apenasPrimeiro: true });
+      const ok = await enviarWhatsApp(textoVoltou(titulo, foraDesde), { tecnico: true });
       if (ok) await estadoGravar(db, "queda_avisada", "");
       else log("aviso de volta do portal falhou; fica para a proxima rodada");
     }
