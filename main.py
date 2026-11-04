@@ -1215,6 +1215,71 @@ async def _popup(portal, fechar=True):
     return p
 
 
+_JS_TELA_LANCAMENTOS = """
+() => {
+  const txt = document.body.innerText || '';
+  const visivel = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+  const msgs = [...document.querySelectorAll('.msgSucesso, .msgErro, .mensagem, .alert, .erro, .error, .aviso')]
+    .filter(visivel).map(e => (e.innerText || '').replace(/\\s+/g, ' ').trim()).filter(Boolean).slice(0, 5);
+  return {
+    eh_tela_lancamentos: /Lan[cç]amentos identificados para essa nota/i.test(txt),
+    tem_continuar: visivel(document.querySelector('#btnContinuar')),
+    mensagens: msgs,
+  };
+}
+"""
+
+
+async def _continuar_ate_informacoes(portal, diagnostico, clicar_primeiro=True,
+                                     espera_total=120, recliques=1):
+    """Clica em Continuar (#btnContinuar) e espera a tela 'Informacoes da Nota
+    Fiscal'. Com grade grande (120 lancamentos na O.S. 257009) o postback
+    demora mais que 25 s. Le e fecha popup do portal no caminho; se for erro,
+    para com o texto. So reclica Continuar se, depois de esperar metade do
+    tempo, ainda estiver na tela de lancamentos -- nunca outro botao."""
+    eventos = []
+    diagnostico["continuar"] = eventos
+    if clicar_primeiro:
+        await portal.click("#btnContinuar", timeout=10000)
+        eventos.append("clique Continuar")
+    inicio = asyncio.get_event_loop().time()
+    ultimo_clique = inicio
+    info = {}
+    while True:
+        await asyncio.sleep(4)
+        try:
+            await portal.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        p = await _popup(portal, fechar=True)
+        if p.get("aberto"):
+            eventos.append(f"popup: {p.get('texto')}")
+            if p.get("eh_erro"):
+                raise Exception(f"o portal recusou o Continuar com o aviso: {p.get('texto')}")
+        info = await portal.evaluate(_JS_RESUMO_NOTA)
+        if info.get("eh_tela_informacoes"):
+            eventos.append("tela Informacoes")
+            return info
+        agora = asyncio.get_event_loop().time()
+        if agora - inicio > espera_total:
+            break
+        tela = await portal.evaluate(_JS_TELA_LANCAMENTOS)
+        if tela.get("mensagens"):
+            eventos.append(f"mensagens: {tela.get('mensagens')}")
+        if (recliques > 0 and tela.get("eh_tela_lancamentos") and tela.get("tem_continuar")
+                and agora - ultimo_clique > espera_total / 2):
+            await portal.click("#btnContinuar", timeout=10000)
+            recliques -= 1
+            ultimo_clique = agora
+            eventos.append("reclique Continuar")
+    tela = await portal.evaluate(_JS_TELA_LANCAMENTOS)
+    raise Exception(
+        f"nao cai na tela 'Informacoes da Nota Fiscal' depois de Continuar "
+        f"(esperei {espera_total}s; eventos={eventos}; mensagens={tela.get('mensagens')}; "
+        f"texto={(info.get('texto') or '')[:300]})"
+    )
+
+
 async def _conferir_status_na_lista(portal, codigo_nota):
     """Prova final: volta em Financeiro > Consultar Nota Fiscal e le o status
     da nota na lista (tem de sair de 'Em cadastramento')."""
@@ -1264,16 +1329,47 @@ async def _abrir_nota_em_cadastramento(portal, codigo_nota):
         " el.getAttribute('onclick'), el.getAttribute('src')].join(' ')")
     if _RE_ACAO_PERIGOSA.search(rotulos or ""):
         raise Exception(f"o alvo para abrir a nota parece acao destrutiva ({rotulos[:150]})")
-    await alvo_click.click(timeout=10000)
-    await asyncio.sleep(4)
+    # A nota pode abrir em OUTRA janela (como a lupa da O.S.) ou na mesma aba.
+    pagina = portal
+    clicou = False
     try:
-        await portal.wait_for_load_state("networkidle", timeout=20000)
+        async with portal.context.expect_page(timeout=6000) as nova:
+            await alvo_click.click(timeout=10000)
+            clicou = True
+        pagina = await nova.value
+        pagina.on("dialog", lambda d: _tratar_dialogo(d, []))
     except Exception:
-        pass
-    info = await portal.evaluate(_JS_RESUMO_NOTA)
+        if not clicou:
+            raise
+    # Espera ate 45 s por uma das duas telas conhecidas (postback lento).
+    info, tela = {}, {}
+    for _ in range(9):
+        await asyncio.sleep(5)
+        try:
+            await pagina.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        await _popup(pagina, fechar=True)
+        info = await pagina.evaluate(_JS_RESUMO_NOTA)
+        if info.get("eh_tela_informacoes"):
+            break
+        tela = await pagina.evaluate(_JS_TELA_LANCAMENTOS)
+        if tela.get("eh_tela_lancamentos") and tela.get("tem_continuar"):
+            break
     if not info.get("eh_tela_informacoes"):
-        raise Exception("abri a linha e nao cai na tela 'Informacoes da Nota Fiscal'")
-    return info, alvo
+        # Rascunho que parou antes do Continuar abre na tela de lancamentos
+        # (caso da O.S. 257009): os lancamentos ja estao identificados, falta
+        # so avancar.
+        if not (tela.get("eh_tela_lancamentos") and tela.get("tem_continuar")):
+            raise Exception(
+                "abri a linha e nao cai na tela 'Informacoes da Nota Fiscal' nem na de "
+                f"lancamentos (nova_janela={pagina is not portal}; url={pagina.url}; "
+                f"cliquei em=[{(rotulos or '')[:200]}]; linha={(alvo.get('html') or '')[:1500]}; "
+                f"texto={(info.get('texto') or '')[:300]})")
+        diagnostico = {}
+        info = await _continuar_ate_informacoes(pagina, diagnostico)
+        alvo = dict(alvo, avancou_de_lancamentos=diagnostico.get("continuar"))
+    return info, alvo, pagina
 
 
 async def _concluir_nota(portal, req, diagnostico):
@@ -1433,8 +1529,11 @@ async def _nf_incluir(req):
             portal.on("dialog", lambda d: _tratar_dialogo(d, dialogos))
 
             if req.retomar:
-                info, alvo = await _abrir_nota_em_cadastramento(portal, req.codigo_nota)
-                diagnostico["nota_retomada"] = {"codigo": alvo.get("codigo")}
+                info, alvo, pagina_nota = await _abrir_nota_em_cadastramento(portal, req.codigo_nota)
+                if pagina_nota is not portal:
+                    portal = pagina_nota
+                diagnostico["nota_retomada"] = {"codigo": alvo.get("codigo"),
+                                                "avancou_de_lancamentos": alvo.get("avancou_de_lancamentos")}
                 _conferir_resumo_portal(info, req)
                 resposta = {
                     "sucesso": True, "etapa": req.ate, "conta": req.conta, "os": os_numero,
@@ -1486,20 +1585,8 @@ async def _nf_incluir(req):
             identificados = await portal.evaluate(_JS_IDENTIFICADOS)
             diagnostico["identificados"] = identificados
 
-            await portal.click("#btnContinuar", timeout=10000)
-            await asyncio.sleep(5)
-            try:
-                await portal.wait_for_load_state("networkidle", timeout=20000)
-            except Exception:
-                pass
-
-            info = await portal.evaluate(_JS_RESUMO_NOTA)
+            info = await _continuar_ate_informacoes(portal, diagnostico)
             diagnostico["tela_informacoes"] = info
-            if not info.get("eh_tela_informacoes"):
-                raise Exception(
-                    f"nao cai na tela 'Informacoes da Nota Fiscal' depois de Continuar "
-                    f"(texto={(info.get('texto') or '')[:300]})"
-                )
 
             # CONFERENCIA 2 -- o que o PORTAL diz que vai para a nota.
             _conferir_resumo_portal(info, req)
