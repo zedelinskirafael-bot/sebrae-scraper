@@ -4,8 +4,10 @@
 // da Linski; se a validade dela e MAIOR que a ja cadastrada no portal do Sebrae,
 // cadastra pela rota /crf-incluir do scraper (a mesma do playbook
 // sebrae-cadastrar-certidao-negativa-fgts) e avisa o Rafael no WhatsApp.
-// Sem certidao nova = so loga. Falha = avisa o Rafael (1x por dia) e tenta de
-// novo no dia seguinte. DRY_RUN=1 mostra o que faria, sem tocar no portal.
+// Sem certidao nova = so loga. Falha = UMA tentativa so (decisao do Rafael,
+// 11/11/2026): avisa o motivo, manda o PDF no WhatsApp para ele anexar na mao e
+// nao tenta de novo aquela certidao. DRY_RUN=1 mostra o que faria, sem tocar no
+// portal; CRF_TESTE_AVISO=1 manda o aviso de falha + PDF marcado como TESTE.
 
 const fs = require("fs");
 const { Client } = require("pg");
@@ -20,7 +22,16 @@ const {
   SCRAPER_URL = "http://127.0.0.1:8001",
   DRY_RUN = "",
   CRF_IGNORAR_ESTADO = "", // teste: age como se o portal nao tivesse nada
+  CRF_TESTE_AVISO = "", // teste: so manda o aviso de falha + PDF (marcado TESTE)
+  EVO_URL,
+  EVO_KEY,
+  EVO_INSTANCE = "claudinho",
+  DESTINO_TECNICO,
+  DESTINOS,
 } = process.env;
+
+// Aviso da certidao vai so para o Rafael (mesmo destino do alerta tecnico).
+const destinoRafael = (DESTINO_TECNICO || "").trim() || (DESTINOS || "").split(",")[0].trim();
 
 const v = comum.criar({ nome: "vigia-crf", prefixoEstado: "crf", minutosPorRodada: 1440 });
 const { log } = v;
@@ -33,7 +44,6 @@ function lerVar(arquivo, nome) {
 }
 
 const br = (iso) => iso.split("-").reverse().join("/"); // 2026-12-09 -> 09/12/2026
-const hojeBR = () => new Date().toLocaleDateString("pt-BR", { timeZone: comum.TZ });
 
 async function certidaoMaisNova() {
   const db = new Client({
@@ -101,13 +111,57 @@ function textoOk(crf, linha) {
   );
 }
 
-function textoFalha(crf, erro) {
+function textoFalha(crf, erro, teste = false) {
   return (
+    (teste ? "🧪 *TESTE — nada aconteceu no portal*\n" : "") +
     `⚠️ *Certidão do FGTS — não consegui cadastrar no portal do Sebrae*\n` +
-    `CRF nº ${crf.crf_numero} (válida até ${br(crf.fim)})\n` +
-    `Motivo: ${String(erro).slice(0, 220)}\n` +
-    `Tento de novo amanhã às 11h50. Se preferir, peça ao Sócio para atualizar pelo playbook.`
+    `CRF nº ${crf.crf_numero} (válida de ${br(crf.ini)} a ${br(crf.fim)})\n` +
+    `Motivo: ${String(erro).slice(0, 220)}\n\n` +
+    `Não vou tentar de novo. O PDF vem logo abaixo para você anexar em ` +
+    `*Financeiro › Certidão Negativa › Incluir*: tipo FGTS, emissão ${br(crf.ini)}, ` +
+    `validade ${br(crf.fim)}, vínculo Sócio.\n` +
+    `Se o portal disser que essa validade já existe, é porque chegou a gravar — aí é só conferir.`
   );
+}
+
+async function enviarPdf(crf) {
+  if (!EVO_URL || !EVO_KEY || !destinoRafael) {
+    log("sem credencial Evolution/destino; PDF não enviado");
+    return false;
+  }
+  try {
+    const r = await fetch(`${EVO_URL}/message/sendMedia/${EVO_INSTANCE}`, {
+      method: "POST",
+      headers: { apikey: EVO_KEY, "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({
+        number: destinoRafael,
+        mediatype: "document",
+        mimetype: "application/pdf",
+        fileName: `CRF FGTS - 61.062.750 LTDA - valida ate ${br(crf.fim).replace(/\//g, "-")}.pdf`,
+        media: crf.pdf_base64.split(",").pop(),
+      }),
+    });
+    if (!r.ok) {
+      log(`envio do PDF falhou HTTP ${r.status}: ${(await r.text().catch(() => "")).slice(0, 200)}`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    log("erro ao enviar o PDF:", e.message || e);
+    return false;
+  }
+}
+
+// Aviso de falha = texto + PDF. O que nao sair fica em "aviso_falha_pendente"
+// ("tudo" ou "pdf") e e retentado na rodada seguinte -- o portal, nao.
+async function avisarFalha(db, crf, erro, falta = "tudo", teste = false) {
+  let okTexto = falta === "pdf";
+  if (!okTexto) okTexto = await v.enviarWhatsApp(textoFalha(crf, erro, teste), { tecnico: true });
+  const okPdf = okTexto ? await enviarPdf(crf) : false;
+  const pendente = !okTexto ? "tudo" : !okPdf ? "pdf" : "";
+  if (!teste) await v.estadoGravar(db, "aviso_falha_pendente", pendente);
+  log(`aviso de falha: texto ${okTexto ? "ok" : "falhou"}, PDF ${okPdf ? "ok" : "falhou"}`);
+  return !pendente;
 }
 
 async function main() {
@@ -126,6 +180,25 @@ async function main() {
       log("nenhuma CRF regular vigente no Portal; nada a fazer (irregularidade o Claudinho avisa)");
       return;
     }
+
+    if (CRF_TESTE_AVISO) {
+      await avisarFalha(db, crf, "isto é um teste do aviso; o portal não foi acessado", "tudo", true);
+      return;
+    }
+
+    // Ja tentou ESTA certidao e falhou: nao tenta de novo (o Rafael anexa na mao).
+    // So completa o aviso que nao tiver saido. A proxima certidao (validade maior)
+    // volta a ser tentada normalmente.
+    const falhou = await v.estadoLer(db, "falhou_validade");
+    if (falhou && crf.fim <= falhou) {
+      const falta = await v.estadoLer(db, "aviso_falha_pendente");
+      if (falta === "tudo" || falta === "pdf") {
+        await avisarFalha(db, crf, (await v.estadoLer(db, "ultimo_erro")) || "?", falta);
+      }
+      log(`CRF ${crf.crf_numero} falhou antes; aguardando o cadastro manual, não tento de novo`);
+      return;
+    }
+
     const noPortal = CRF_IGNORAR_ESTADO ? null : await v.estadoLer(db, "validade_portal");
     if (noPortal && crf.fim <= noPortal) {
       log(`CRF ${crf.crf_numero} (até ${br(crf.fim)}) já está no portal; nada a fazer`);
@@ -165,12 +238,10 @@ async function main() {
     }
 
     const erro = res.erro || res.detail || "resposta sem sucesso";
-    log(`falhou: ${erro}`);
-    if ((await v.estadoLer(db, "falha_avisada_em")) !== hojeBR()) {
-      if (await v.enviarWhatsApp(textoFalha(crf, erro), { tecnico: true })) {
-        await v.estadoGravar(db, "falha_avisada_em", hojeBR());
-      }
-    }
+    log(`falhou: ${erro} -- não vou tentar de novo esta certidão`);
+    await v.estadoGravar(db, "falhou_validade", crf.fim);
+    await v.estadoGravar(db, "ultimo_erro", String(erro).slice(0, 500));
+    await avisarFalha(db, crf, erro);
   });
 }
 

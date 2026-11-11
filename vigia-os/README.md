@@ -80,10 +80,15 @@ Mudança só em "Última interação" (nome do analista) ou no valor grava em si
   (`DESTINO_TECNICO`): "✅ Certidão do FGTS atualizada no portal do Sebrae".
 - Portal já tinha essa validade (cadastro na mão) → a trava de duplicata da rota recusa; o vigia
   só atualiza o estado, sem aviso.
-- Falha → "⚠️ não consegui cadastrar" para o Rafael (1x por dia) e tenta no dia seguinte. Aviso
-  de sucesso que não saiu fica em `crf:rafael:aviso_pendente` e é retentado na rodada seguinte.
+- Falha → **uma tentativa só** (decisão do Rafael, 11/11/2026): manda "⚠️ não consegui
+  cadastrar" com o motivo **e o PDF** (Evolution `sendMedia`) para ele anexar na mão, grava
+  `crf:rafael:falhou_validade` e não tenta de novo aquela certidão. A próxima (validade maior)
+  volta a ser tentada. Texto ou PDF que não saiu fica em `crf:rafael:aviso_falha_pendente`
+  (`tudo`/`pdf`) e só o aviso é retentado na rodada seguinte — o portal, não.
+- Aviso de sucesso que não saiu fica em `crf:rafael:aviso_pendente` e é retentado.
 - Teste: `DRY_RUN=1` (só lê e mostra o aviso); `CRF_IGNORAR_ESTADO=1` (ignora o estado — com a
-  certidão já no portal, a trava recusa e nada é gravado).
+  certidão já no portal, a trava recusa e nada é gravado); `CRF_TESTE_AVISO=1` (manda ao Rafael
+  o aviso de falha + PDF marcado "🧪 TESTE", sem acessar o portal nem gravar estado).
 - Log `/var/log/sebrae-crf-vigia.log`.
 
 ## Regras comuns
