@@ -66,6 +66,26 @@ Mudança só em "Última interação" (nome do analista) ou no valor grava em si
 - Falha: avisa só o Rafael na 6ª seguida (6h), uma vez por dia.
 - Log `/var/log/sebrae-nf-vigia.log`.
 
+## Vigia da certidão do FGTS (desde 11/11/2026)
+
+`vigia-crf.js` + `sebrae-crf-vigia.{service,timer}`: 1x por dia às **11h50 BRT** (14:50 UTC,
+`Persistent=true`), depois que o Claudinho emitiu (worker do notebook, 8h–10h) e entregou a CRF
+(envio 10h20–11h19).
+
+- Lê no **banco do Portal Linski** (`fgts_crf_certidoes`) a CRF REGULAR vigente mais nova do CNPJ
+  `61062750000182`. Conexão: `SUPABASE_DB_URL` lida de `/opt/das-mei-worker/.env`; token da rota:
+  `NF_TOKEN` lido de `/opt/ia-hub/.env` (só a variável — nada é copiado).
+- Validade maior que a cadastrada (`sebrae_os_vigia_estado`, chave `crf:rafael:validade_portal`)
+  → `POST /crf-incluir` com `ate=fim` (conta rafael, vínculo Sócio) → avisa **só o Rafael**
+  (`DESTINO_TECNICO`): "✅ Certidão do FGTS atualizada no portal do Sebrae".
+- Portal já tinha essa validade (cadastro na mão) → a trava de duplicata da rota recusa; o vigia
+  só atualiza o estado, sem aviso.
+- Falha → "⚠️ não consegui cadastrar" para o Rafael (1x por dia) e tenta no dia seguinte. Aviso
+  de sucesso que não saiu fica em `crf:rafael:aviso_pendente` e é retentado na rodada seguinte.
+- Teste: `DRY_RUN=1` (só lê e mostra o aviso); `CRF_IGNORAR_ESTADO=1` (ignora o estado — com a
+  certidão já no portal, a trava recusa e nada é gravado).
+- Log `/var/log/sebrae-crf-vigia.log`.
+
 ## Regras comuns
 
 - **Primeira rodada = baseline**: grava tudo e não avisa.
@@ -80,7 +100,7 @@ Mudança só em "Última interação" (nome do analista) ou no valor grava em si
 - **Layout mudou** (portal diz que há linhas/páginas e o leitor não lê nenhuma): falha alta,
   nunca `[]` como sucesso.
 - **Sessão única do Sebrae**: o scraper serializa toda rota que abre navegador
-  (`SMART_LOCK`). Os vigias esperam o worker da Máquina de Vendas terminar, nunca derrubam a
+  (`SMART_LOCK`). Os vigias esperam o worker do CRM terminar, nunca derrubam a
   sessão dele.
 - Ir direto na URL `/credenciado/Home.do` **não funciona** sem passar pelo botão
   `RedirecionaPCR.do` do Menu Geral (cai no login do SAS).

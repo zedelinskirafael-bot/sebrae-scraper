@@ -1,0 +1,13 @@
+[Unit]
+Description=Vigia da certidao do FGTS (conta Rafael) - cadastra a CRF nova no portal do Sebrae e avisa no WhatsApp
+After=network-online.target postgresql.service docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/sebrae-os-vigia
+EnvironmentFile=/opt/sebrae-os-vigia/.env
+ExecStart=/usr/bin/node /opt/sebrae-os-vigia/vigia-crf.js
+TimeoutStartSec=900
+StandardOutput=append:/var/log/sebrae-crf-vigia.log
+StandardError=append:/var/log/sebrae-crf-vigia.log

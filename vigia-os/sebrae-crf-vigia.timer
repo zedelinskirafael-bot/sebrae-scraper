@@ -1,0 +1,10 @@
+[Unit]
+Description=Roda o vigia da certidao do FGTS 1x por dia, 11h50 BRT (14:50 UTC), depois da emissao e da entrega do Claudinho
+
+[Timer]
+OnCalendar=*-*-* 14:50:00
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
